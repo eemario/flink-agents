@@ -32,6 +32,7 @@ import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Supplier;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -164,6 +165,68 @@ class ParallelExecutionCoordinatorTest {
 
     @Test
     @Timeout(15)
+    void commitDrainFailureAmongSiblingsDoesNotLeakLockOrWedgeGroup() throws Exception {
+        ParallelExecutionLock lock = new ParallelExecutionLock();
+        BlockingQueue<ThrowingRunnable<? extends Exception>> mails = new LinkedBlockingQueue<>();
+        List<String> events = Collections.synchronizedList(new ArrayList<>());
+        Queue<ParallelExecutionTask> works = new ConcurrentLinkedQueue<>();
+        CountDownLatch aStarted = new CountDownLatch(1);
+        CountDownLatch bStarted = new CountDownLatch(1);
+        CountDownLatch allowA = new CountDownLatch(1);
+        CountDownLatch allowB = new CountDownLatch(1);
+        RuntimeException commitFailure = new RuntimeException("commit failure");
+
+        try (ParallelExecutionCoordinator coordinator =
+                newCoordinator(2, lock, mails, works::poll)) {
+            lock.acquireByMain();
+            works.add(
+                    FakeWork.blockingAsync(
+                            "A",
+                            events,
+                            lock,
+                            () -> {
+                                aStarted.countDown();
+                                await(allowA);
+                            }));
+            coordinator.addTask(KEY);
+            lock.release();
+            assertThat(aStarted.await(5, TimeUnit.SECONDS)).isTrue();
+
+            works.add(
+                    FakeWork.blockingAsyncFailingCommit(
+                            "B",
+                            events,
+                            lock,
+                            () -> {
+                                bStarted.countDown();
+                                await(allowB);
+                            },
+                            commitFailure));
+            lock.acquireByMain();
+            coordinator.addTask(KEY);
+            lock.release();
+            assertThat(bStarted.await(5, TimeUnit.SECONDS)).isTrue();
+
+            allowB.countDown();
+            runOneMail(mails);
+            assertThat(committed(events)).isEmpty();
+            assertThat(coordinator.hasOutstanding(KEY)).isTrue();
+
+            allowA.countDown();
+            assertThatThrownBy(() -> runOneMail(mails)).isSameAs(commitFailure);
+
+            lock.acquireByMain();
+            lock.release();
+            assertThat(coordinator.hasOutstanding(KEY)).isFalse();
+            assertThat(committed(events)).containsExactly("A");
+        } finally {
+            allowA.countDown();
+            allowB.countDown();
+        }
+    }
+
+    @Test
+    @Timeout(15)
     void hasOutstandingReflectsOutstandingWork() throws Exception {
         ParallelExecutionLock lock = new ParallelExecutionLock();
         BlockingQueue<ThrowingRunnable<? extends Exception>> mails = new LinkedBlockingQueue<>();
@@ -196,6 +259,87 @@ class ParallelExecutionCoordinatorTest {
             allow.countDown();
             runOneMail(mails);
             assertThat(coordinator.hasOutstanding(KEY)).isFalse();
+        } finally {
+            allow.countDown();
+        }
+    }
+
+    @Test
+    @Timeout(15)
+    void isQuiescedTracksInFlightWork() throws Exception {
+        ParallelExecutionLock lock = new ParallelExecutionLock();
+        BlockingQueue<ThrowingRunnable<? extends Exception>> mails = new LinkedBlockingQueue<>();
+        List<String> events = Collections.synchronizedList(new ArrayList<>());
+        Queue<ParallelExecutionTask> works = new ConcurrentLinkedQueue<>();
+        CountDownLatch started = new CountDownLatch(1);
+        CountDownLatch allow = new CountDownLatch(1);
+        try (ParallelExecutionCoordinator coordinator = newCoordinator(lock, mails, works::poll)) {
+            // No in-flight work: quiesced.
+            assertThat(coordinator.isQuiesced()).isTrue();
+
+            lock.acquireByMain();
+            works.add(
+                    FakeWork.blockingAsync(
+                            "A",
+                            events,
+                            lock,
+                            () -> {
+                                started.countDown();
+                                await(allow);
+                            }));
+            coordinator.addTask(KEY);
+            lock.release();
+
+            assertThat(started.await(5, TimeUnit.SECONDS)).isTrue();
+            // Pulled and executing but not yet committed: not quiesced.
+            assertThat(coordinator.isQuiesced()).isFalse();
+
+            allow.countDown();
+            runOneMail(mails); // commit drain removes the node
+            assertThat(coordinator.isQuiesced()).isTrue();
+        } finally {
+            allow.countDown();
+        }
+    }
+
+    @Test
+    @Timeout(15)
+    void drainingPausesNewDispatchUntilStopped() throws Exception {
+        ParallelExecutionLock lock = new ParallelExecutionLock();
+        BlockingQueue<ThrowingRunnable<? extends Exception>> mails = new LinkedBlockingQueue<>();
+        List<String> events = Collections.synchronizedList(new ArrayList<>());
+        Queue<ParallelExecutionTask> works = new ConcurrentLinkedQueue<>();
+        CountDownLatch started = new CountDownLatch(1);
+        CountDownLatch allow = new CountDownLatch(1);
+        try (ParallelExecutionCoordinator coordinator = newCoordinator(lock, mails, works::poll)) {
+            coordinator.startDraining();
+
+            works.add(
+                    FakeWork.blockingAsync(
+                            "A",
+                            events,
+                            lock,
+                            () -> {
+                                started.countDown();
+                                await(allow);
+                            }));
+            lock.acquireByMain();
+            coordinator.addTask(KEY);
+            lock.release();
+
+            // While draining, the worker declines the pulled credit; the task is not started, but
+            // its node stays pending (outstanding), so its task stays in the durable queue.
+            assertThat(started.await(1, TimeUnit.SECONDS)).isFalse();
+            assertThat(events).isEmpty();
+            assertThat(coordinator.hasOutstanding(KEY)).isTrue();
+
+            // Resuming dispatch alone must revive the worker — no other mailbox lock cycle runs.
+            coordinator.stopDraining();
+            assertThat(started.await(5, TimeUnit.SECONDS)).isTrue();
+            assertThat(coordinator.isQuiesced()).isFalse();
+
+            allow.countDown();
+            runOneMail(mails);
         } finally {
             allow.countDown();
         }
@@ -254,6 +398,60 @@ class ParallelExecutionCoordinatorTest {
         } finally {
             allowFinish.countDown();
             coordinator.close();
+        }
+    }
+
+    @Test
+    @Timeout(15)
+    void startDrainingFencesInProgressPullSoQuiesceCannotMissIt() throws Exception {
+        ParallelExecutionLock lock = new ParallelExecutionLock();
+        BlockingQueue<ThrowingRunnable<? extends Exception>> mails = new LinkedBlockingQueue<>();
+        List<String> events = Collections.synchronizedList(new ArrayList<>());
+        CountDownLatch factoryEntered = new CountDownLatch(1);
+        CountDownLatch allowFactory = new CountDownLatch(1);
+        CountDownLatch drainerDone = new CountDownLatch(1);
+        AtomicBoolean quiescedAfterFence = new AtomicBoolean();
+        // The factory runs inside the worker's pull section: after the draining check, before
+        // inFlightExecuting is incremented — exactly the TOCTOU window.
+        Supplier<ParallelExecutionTask> works =
+                () -> {
+                    factoryEntered.countDown();
+                    await(allowFactory);
+                    return FakeWork.blocking("A", events, () -> {});
+                };
+        try (ParallelExecutionCoordinator coordinator = newCoordinator(lock, mails, works)) {
+            lock.acquireByMain();
+            coordinator.addTask(KEY);
+            lock.release();
+            assertThat(factoryEntered.await(5, TimeUnit.SECONDS)).isTrue();
+
+            // Start draining while the worker sits in the window; the fence must block until the
+            // worker's lock hold (which includes the increment) is over.
+            Thread drainer =
+                    new Thread(
+                            () -> {
+                                try {
+                                    coordinator.startDraining();
+                                } catch (InterruptedException e) {
+                                    Thread.currentThread().interrupt();
+                                }
+                                quiescedAfterFence.set(coordinator.isQuiesced());
+                                drainerDone.countDown();
+                            });
+            drainer.start();
+            // Give the drainer time to reach the fence (pre-fix it would finish immediately).
+            Thread.sleep(300L);
+            allowFactory.countDown();
+            assertThat(drainerDone.await(5, TimeUnit.SECONDS)).isTrue();
+
+            // The pulled-but-uncommitted task must be visible to the quiesce check.
+            assertThat(quiescedAfterFence.get()).isFalse();
+
+            coordinator.stopDraining();
+            runOneMail(mails);
+            assertThat(coordinator.isQuiesced()).isTrue();
+        } finally {
+            allowFactory.countDown();
         }
     }
 
@@ -559,6 +757,15 @@ class ParallelExecutionCoordinatorTest {
         static FakeWork blockingAsync(
                 String id, List<String> events, ParallelExecutionLock lock, Runnable onExecute) {
             return new FakeWork(id, events, onExecute, lock, null);
+        }
+
+        static FakeWork blockingAsyncFailingCommit(
+                String id,
+                List<String> events,
+                ParallelExecutionLock lock,
+                Runnable onExecute,
+                RuntimeException commitFailure) {
+            return new FakeWork(id, events, onExecute, lock, commitFailure);
         }
 
         static FakeWork failingCommit(

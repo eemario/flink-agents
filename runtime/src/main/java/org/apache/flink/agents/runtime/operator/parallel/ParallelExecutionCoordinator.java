@@ -56,6 +56,17 @@ public final class ParallelExecutionCoordinator implements AutoCloseable {
     /** Supplies a fresh work; the work pulls and prepares its own task inside {@code execute()}. */
     private final Supplier<ParallelExecutionTask> workFactory;
 
+    /** Tasks pulled but not yet committed; read by {@link #isQuiesced()} for checkpoint quiesce. */
+    private final AtomicInteger inFlightExecuting = new AtomicInteger();
+
+    /**
+     * When {@code true}, workers finish in-flight tasks but pull no new nodes. Set before a
+     * checkpoint, cleared once the snapshot is taken.
+     */
+    private volatile boolean draining;
+
+    private final Object drainMonitor = new Object();
+
     /**
      * Permits submitted and not yet fully redeemed; compared against the pool size by {@link
      * DispatchQueue#offer} to decide when the pool must grow.
@@ -113,8 +124,40 @@ public final class ParallelExecutionCoordinator implements AutoCloseable {
     }
 
     /**
+     * Pauses new task dispatch before a checkpoint: workers finish and commit in-flight tasks but
+     * pull no new nodes. Returns only after fencing in-progress pulls: a worker increments {@link
+     * #inFlightExecuting} before it first releases the lock, so after the acquire/release below
+     * {@link #isQuiesced()} can no longer miss a pulled task.
+     */
+    public void startDraining() throws InterruptedException {
+        draining = true;
+        parallelExecutionLock.acquireByMain();
+        parallelExecutionLock.release();
+    }
+
+    /**
+     * Resumes task dispatch after a checkpoint: wakes parked workers, then consumes any dangling
+     * sticky main-grant left by a declining worker (one acquire/release) so woken workers can take
+     * the lock immediately instead of stalling until the next mailbox action.
+     */
+    public void stopDraining() throws InterruptedException {
+        synchronized (drainMonitor) {
+            draining = false;
+            drainMonitor.notifyAll();
+        }
+        parallelExecutionLock.acquireByMain();
+        parallelExecutionLock.release();
+    }
+
+    /** Whether no task is currently pulled-but-uncommitted, i.e. a safe point for a snapshot. */
+    public boolean isQuiesced() {
+        return inFlightExecuting.get() == 0;
+    }
+
+    /**
      * Redeems one dispatch permit: under the lock, takes the highest-priority pending node, runs a
-     * fresh work, then hands the completion to the mailbox commit drain.
+     * fresh work, then hands the completion to the mailbox commit drain. During a checkpoint drain
+     * the permit is not forfeited: the thread parks and redeems it afterwards.
      */
     private void runOneTask() {
         try {
@@ -123,6 +166,18 @@ public final class ParallelExecutionCoordinator implements AutoCloseable {
             try {
                 // Fresh pulls acquire at the lowest priority: async resumes always take precedence.
                 parallelExecutionLock.acquireByWorker(Long.MAX_VALUE, Long.MAX_VALUE);
+                while (draining) {
+                    // Park without the lock until the drain ends; the node stays pending
+                    // meanwhile. No main-thread reservation is left behind, so in-flight tasks
+                    // can re-acquire the lock and commit while this worker waits.
+                    parallelExecutionLock.release();
+                    synchronized (drainMonitor) {
+                        while (draining) {
+                            drainMonitor.wait();
+                        }
+                    }
+                    parallelExecutionLock.acquireByWorker(Long.MAX_VALUE, Long.MAX_VALUE);
+                }
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 return;
@@ -135,6 +190,7 @@ public final class ParallelExecutionCoordinator implements AutoCloseable {
                 ParallelExecutionTask work = workFactory.get();
                 work.setup(node.getKey(), node.getRecordIndex(), node.getTaskIndex());
                 node.setWork(work);
+                inFlightExecuting.incrementAndGet();
                 // execute() never throws: it captures pull/prepare/run failures and rethrows at
                 // commit.
                 work.execute();
@@ -175,6 +231,7 @@ public final class ParallelExecutionCoordinator implements AutoCloseable {
                     lastCommitted = head.getWork();
                 } finally {
                     schedule.removeCommitted(head);
+                    inFlightExecuting.decrementAndGet();
                 }
             }
             completedNode.getWork().finishGroup(lastCommitted);

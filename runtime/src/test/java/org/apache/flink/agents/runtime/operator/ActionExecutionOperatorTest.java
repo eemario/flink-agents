@@ -77,6 +77,7 @@ import org.apache.flink.streaming.api.operators.AbstractStreamOperator;
 import org.apache.flink.streaming.api.operators.StreamOperatorStateHandler;
 import org.apache.flink.streaming.api.watermark.Watermark;
 import org.apache.flink.streaming.runtime.streamrecord.StreamRecord;
+import org.apache.flink.streaming.runtime.tasks.mailbox.Mail;
 import org.apache.flink.streaming.runtime.tasks.mailbox.TaskMailbox;
 import org.apache.flink.streaming.util.AbstractStreamOperatorTestHarness;
 import org.apache.flink.streaming.util.KeyedOneInputStreamOperatorTestHarness;
@@ -390,6 +391,8 @@ public class ActionExecutionOperatorTest {
             } finally {
                 TestAgent.SIBLING_ACTION_A_ALLOW.countDown();
                 TestAgent.SIBLING_ACTION_B_ALLOW.countDown();
+                ((ActionExecutionOperator<Long, Object>) testHarness.getOperator())
+                        .waitInFlightEventsFinished();
             }
         }
     }
@@ -431,6 +434,98 @@ public class ActionExecutionOperatorTest {
         } finally {
             TestAgent.SIBLING_ACTION_A_ALLOW.countDown();
             TestAgent.SIBLING_ACTION_B_ALLOW.countDown();
+        }
+    }
+
+    @Test
+    @Timeout(15)
+    void staleCompletionMailAfterFullDrainIsNoOp() throws Exception {
+        assumeFalse(ContinuationActionExecutor.isContinuationSupported());
+        TestAgent.resetSiblingParallelFixture();
+        AgentConfiguration config = new AgentConfiguration();
+        config.set(AgentExecutionOptions.NUM_ASYNC_THREADS, 2);
+
+        try (KeyedOneInputStreamOperatorTestHarness<Long, Long, Object> testHarness =
+                new KeyedOneInputStreamOperatorTestHarness<>(
+                        new ActionExecutionOperatorFactory(
+                                TestAgent.getSiblingParallelAgentPlan(config), true),
+                        (KeySelector<Long, Long>) value -> value,
+                        TypeInformation.of(Long.class))) {
+            testHarness.open();
+            testHarness.processElement(new StreamRecord<>(0L));
+            assertThat(TestAgent.BOTH_SIBLING_ASYNC_STARTED.await(5, TimeUnit.SECONDS)).isTrue();
+
+            // Release both siblings: each worker marks its node done and dispatches its own
+            // completion mail. A worker's releaseToMain reserves the lock for the mailbox, so
+            // interleave mailbox acquire/release cycles (processWatermark) to let the other worker
+            // re-acquire and finish — without consuming the queued completion mails. Wait until
+            // both mails are queued; at that point both nodes are DONE (markDone precedes the
+            // dispatch).
+            TestAgent.SIBLING_ACTION_A_ALLOW.countDown();
+            TestAgent.SIBLING_ACTION_B_ALLOW.countDown();
+            long watermark = 0;
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+            while (testHarness.getTaskMailbox().size() < 2) {
+                assertThat(System.nanoTime() < deadline)
+                        .as("timed out waiting for both completion mails")
+                        .isTrue();
+                testHarness.processWatermark(new Watermark(watermark++));
+                Thread.sleep(5);
+            }
+
+            // The first completion mail finds both nodes DONE, drains and commits both in
+            // taskIndex order, drops the key group, and retires the input.
+            testHarness.getTaskMailbox().take(TaskMailbox.MIN_PRIORITY).run();
+            List<StreamRecord<Object>> output =
+                    (List<StreamRecord<Object>>) testHarness.getRecordOutput();
+            assertThat(output)
+                    .extracting(StreamRecord::getValue)
+                    .containsExactly("sibling-A", "sibling-B");
+
+            // The second (stale) completion mail sees no group and commits nothing; it must be a
+            // no-op rather than attempt to retire the already-retired input.
+            testHarness.getTaskMailbox().take(TaskMailbox.MIN_PRIORITY).run();
+
+            assertThat(
+                            ((ActionExecutionOperator<Long, Object>) testHarness.getOperator())
+                                    .getOperatorStateManager()
+                                    .getProcessingKeys())
+                    .isEmpty();
+        } finally {
+            TestAgent.SIBLING_ACTION_A_ALLOW.countDown();
+            TestAgent.SIBLING_ACTION_B_ALLOW.countDown();
+        }
+    }
+
+    @Test
+    void openRejectsNonPositiveNumAsyncThreads() throws Exception {
+        AgentConfiguration config = new AgentConfiguration();
+        config.set(AgentExecutionOptions.NUM_ASYNC_THREADS, 0);
+        try (KeyedOneInputStreamOperatorTestHarness<Long, Long, Object> testHarness =
+                new KeyedOneInputStreamOperatorTestHarness<>(
+                        new ActionExecutionOperatorFactory(
+                                TestAgent.getAgentPlanWithConfig(config, false), true),
+                        (KeySelector<Long, Long>) value -> value,
+                        TypeInformation.of(Long.class))) {
+            assertThatThrownBy(testHarness::open)
+                    .isInstanceOf(IllegalArgumentException.class)
+                    .hasMessageContaining("num-async-threads");
+        }
+    }
+
+    @Test
+    void openRejectsNonPositiveMaxInFlightInputRecords() throws Exception {
+        AgentConfiguration config = new AgentConfiguration();
+        config.set(AgentExecutionOptions.MAX_IN_FLIGHT_INPUT_RECORDS, 0);
+        try (KeyedOneInputStreamOperatorTestHarness<Long, Long, Object> testHarness =
+                new KeyedOneInputStreamOperatorTestHarness<>(
+                        new ActionExecutionOperatorFactory(
+                                TestAgent.getAgentPlanWithConfig(config, false), true),
+                        (KeySelector<Long, Long>) value -> value,
+                        TypeInformation.of(Long.class))) {
+            assertThatThrownBy(testHarness::open)
+                    .isInstanceOf(IllegalArgumentException.class)
+                    .hasMessageContaining("max-in-flight-input-records");
         }
     }
 
@@ -624,6 +719,261 @@ public class ActionExecutionOperatorTest {
             if (budgetReleaser != null) {
                 budgetReleaser.join();
             }
+        }
+    }
+
+    @Test
+    @Timeout(30)
+    void preBarrierFailureResetsDrainingSoDispatchIsNotWedged() throws Exception {
+        assumeFalse(ContinuationActionExecutor.isContinuationSupported());
+        TestAgent.resetSingleAsyncFixture();
+        AgentConfiguration config = new AgentConfiguration();
+        config.set(AgentExecutionOptions.NUM_ASYNC_THREADS, 1);
+
+        try (KeyedOneInputStreamOperatorTestHarness<Long, Long, Object> testHarness =
+                new KeyedOneInputStreamOperatorTestHarness<>(
+                        new ActionExecutionOperatorFactory(
+                                TestAgent.getSingleAsyncAgentPlan(config), true),
+                        (KeySelector<Long, Long>) value -> value,
+                        TypeInformation.of(Long.class))) {
+            testHarness.open();
+            ActionExecutionOperator<Long, Object> operator =
+                    (ActionExecutionOperator<Long, Object>) testHarness.getOperator();
+
+            // First record is pulled and parks in the async stage; the second queues as a pending
+            // input for the busy key, so a task remains to be dispatched after the drain window.
+            testHarness.processElement(new StreamRecord<>(21L));
+            assertThat(TestAgent.SINGLE_ASYNC_STARTED.await(5, TimeUnit.SECONDS)).isTrue();
+            testHarness.processElement(new StreamRecord<>(21L));
+
+            // Poison the quiesce loop: its first yield runs this mail and prepareSnapshotPreBarrier
+            // fails after startDraining.
+            testHarness
+                    .getTaskMailbox()
+                    .put(
+                            new Mail(
+                                    () -> {
+                                        throw new RuntimeException("boom");
+                                    },
+                                    0,
+                                    "poison mail"));
+            assertThatThrownBy(() -> operator.prepareSnapshotPreBarrier(1L))
+                    .hasMessageContaining("boom");
+
+            // Even if the failure is swallowed upstream, dispatch must not stay paused: releasing
+            // the async action must let both inputs finish without any further checkpoint call.
+            TestAgent.SINGLE_ASYNC_ALLOW.countDown();
+            operator.waitInFlightEventsFinished();
+            List<StreamRecord<Object>> output =
+                    (List<StreamRecord<Object>>) testHarness.getRecordOutput();
+            assertThat(output).extracting(StreamRecord::getValue).containsExactly(42L, 42L);
+        } finally {
+            TestAgent.SINGLE_ASYNC_ALLOW.countDown();
+        }
+    }
+
+    @Test
+    @Timeout(30)
+    void checkpointDrainsInFlightAsyncActionSoOutputIsNotLostOnRestore() throws Exception {
+        assumeFalse(ContinuationActionExecutor.isContinuationSupported());
+        TestAgent.resetSingleAsyncFixture();
+        AgentConfiguration config = new AgentConfiguration();
+        config.set(AgentExecutionOptions.NUM_ASYNC_THREADS, 2);
+
+        Thread releaser = null;
+        try (KeyedOneInputStreamOperatorTestHarness<Long, Long, Object> testHarness =
+                new KeyedOneInputStreamOperatorTestHarness<>(
+                        new ActionExecutionOperatorFactory(
+                                TestAgent.getSingleAsyncAgentPlan(config), true),
+                        (KeySelector<Long, Long>) value -> value,
+                        TypeInformation.of(Long.class))) {
+            testHarness.open();
+            ActionExecutionOperator<Long, Object> operator =
+                    (ActionExecutionOperator<Long, Object>) testHarness.getOperator();
+
+            testHarness.processElement(new StreamRecord<>(21L));
+            // A resident worker pulls the task (removing it from the durable queue) and enters the
+            // async stage; its result is not yet committed.
+            assertThat(TestAgent.SINGLE_ASYNC_STARTED.await(5, TimeUnit.SECONDS)).isTrue();
+
+            // Release the async shortly after, so a checkpoint that drains in-flight work can
+            // complete; the un-fixed engine takes the checkpoint immediately, before this release.
+            releaser =
+                    new Thread(
+                            () -> {
+                                try {
+                                    Thread.sleep(300);
+                                } catch (InterruptedException e) {
+                                    Thread.currentThread().interrupt();
+                                }
+                                TestAgent.SINGLE_ASYNC_ALLOW.countDown();
+                            });
+            releaser.setDaemon(true);
+            releaser.start();
+
+            // StreamTask calls prepareSnapshotPreBarrier before broadcasting the barrier.
+            operator.prepareSnapshotPreBarrier(1L);
+            testHarness.snapshot(1L, 1L);
+
+            // Invariant: once the checkpoint is taken, the in-flight action must already have
+            // committed and emitted its output. Otherwise its output — whose input was consumed
+            // before the barrier — is permanently lost on restore. Fails on the un-fixed engine.
+            List<StreamRecord<Object>> output =
+                    (List<StreamRecord<Object>>) testHarness.getRecordOutput();
+            assertThat(output).extracting(StreamRecord::getValue).containsExactly(42L);
+        } finally {
+            if (TestAgent.SINGLE_ASYNC_ALLOW != null) {
+                TestAgent.SINGLE_ASYNC_ALLOW.countDown();
+            }
+            if (releaser != null) {
+                releaser.join();
+            }
+        }
+    }
+
+    @Test
+    @Timeout(30)
+    void checkpointQuiesceSnapshotAndRestoreDoesNotReplayTransientSchedule() throws Exception {
+        assumeFalse(ContinuationActionExecutor.isContinuationSupported());
+        TestAgent.resetSingleAsyncFixture();
+        AgentConfiguration config = new AgentConfiguration();
+        config.set(AgentExecutionOptions.NUM_ASYNC_THREADS, 2);
+
+        OperatorSubtaskState snapshot;
+        Thread releaser = null;
+        try (KeyedOneInputStreamOperatorTestHarness<Long, Long, Object> testHarness =
+                new KeyedOneInputStreamOperatorTestHarness<>(
+                        new ActionExecutionOperatorFactory(
+                                TestAgent.getSingleAsyncAgentPlan(config), true),
+                        (KeySelector<Long, Long>) value -> value,
+                        TypeInformation.of(Long.class))) {
+            testHarness.open();
+            ActionExecutionOperator<Long, Object> operator =
+                    (ActionExecutionOperator<Long, Object>) testHarness.getOperator();
+
+            testHarness.processElement(new StreamRecord<>(31L));
+            assertThat(TestAgent.SINGLE_ASYNC_STARTED.await(5, TimeUnit.SECONDS)).isTrue();
+
+            releaser =
+                    new Thread(
+                            () -> {
+                                try {
+                                    Thread.sleep(300);
+                                } catch (InterruptedException e) {
+                                    Thread.currentThread().interrupt();
+                                }
+                                TestAgent.SINGLE_ASYNC_ALLOW.countDown();
+                            });
+            releaser.setDaemon(true);
+            releaser.start();
+
+            operator.prepareSnapshotPreBarrier(1L);
+            snapshot = testHarness.snapshot(1L, 1L);
+
+            List<StreamRecord<Object>> output =
+                    (List<StreamRecord<Object>>) testHarness.getRecordOutput();
+            assertThat(output).extracting(StreamRecord::getValue).containsExactly(62L);
+            assertThat(operator.getOperatorStateManager().getProcessingKeys()).isEmpty();
+        } finally {
+            TestAgent.SINGLE_ASYNC_ALLOW.countDown();
+            if (releaser != null) {
+                releaser.join();
+            }
+        }
+
+        TestAgent.resetSingleAsyncFixture();
+        try (KeyedOneInputStreamOperatorTestHarness<Long, Long, Object> restored =
+                new KeyedOneInputStreamOperatorTestHarness<>(
+                        new ActionExecutionOperatorFactory(
+                                TestAgent.getSingleAsyncAgentPlan(config), true),
+                        (KeySelector<Long, Long>) value -> value,
+                        TypeInformation.of(Long.class))) {
+            restored.initializeState(snapshot);
+            restored.open();
+            ActionExecutionOperator<Long, Object> operator =
+                    (ActionExecutionOperator<Long, Object>) restored.getOperator();
+
+            operator.waitInFlightEventsFinished();
+            assertThat(restored.getRecordOutput()).isEmpty();
+
+            TestAgent.SINGLE_ASYNC_ALLOW.countDown();
+            restored.processElement(new StreamRecord<>(32L));
+            operator.waitInFlightEventsFinished();
+
+            List<StreamRecord<Object>> output =
+                    (List<StreamRecord<Object>>) restored.getRecordOutput();
+            assertThat(output).extracting(StreamRecord::getValue).containsExactly(64L);
+        } finally {
+            TestAgent.SINGLE_ASYNC_ALLOW.countDown();
+        }
+    }
+
+    @Test
+    @Timeout(15)
+    void defaultSingleActionPendingEventsDrainOncePerInput() throws Exception {
+        assumeFalse(ContinuationActionExecutor.isContinuationSupported());
+        AgentConfiguration config = new AgentConfiguration();
+        config.set(AgentExecutionOptions.NUM_ASYNC_THREADS, 2);
+
+        try (KeyedOneInputStreamOperatorTestHarness<Long, Long, Object> testHarness =
+                new KeyedOneInputStreamOperatorTestHarness<>(
+                        new ActionExecutionOperatorFactory(
+                                TestAgent.getPendingEventsSingleActionPlan(config), true),
+                        (KeySelector<Long, Long>) value -> value,
+                        TypeInformation.of(Long.class))) {
+            testHarness.open();
+            ActionExecutionOperator<Long, Object> operator =
+                    (ActionExecutionOperator<Long, Object>) testHarness.getOperator();
+
+            testHarness.processElement(new StreamRecord<>(10L));
+            testHarness.processElement(new StreamRecord<>(10L));
+            operator.waitInFlightEventsFinished();
+
+            List<StreamRecord<Object>> output =
+                    (List<StreamRecord<Object>>) testHarness.getRecordOutput();
+            assertThat(output)
+                    .extracting(StreamRecord::getValue)
+                    .containsExactly("single-10", "single-10");
+        }
+    }
+
+    @Test
+    @Timeout(15)
+    void sameKeySiblingPendingEventsStayBufferedUntilCommitDrainReachesTheirTask()
+            throws Exception {
+        assumeFalse(ContinuationActionExecutor.isContinuationSupported());
+        TestAgent.resetSiblingParallelFixture();
+        AgentConfiguration config = new AgentConfiguration();
+        config.set(AgentExecutionOptions.NUM_ASYNC_THREADS, 2);
+
+        try (KeyedOneInputStreamOperatorTestHarness<Long, Long, Object> testHarness =
+                new KeyedOneInputStreamOperatorTestHarness<>(
+                        new ActionExecutionOperatorFactory(
+                                TestAgent.getSiblingParallelAgentPlan(config), true),
+                        (KeySelector<Long, Long>) value -> value,
+                        TypeInformation.of(Long.class))) {
+            testHarness.open();
+            ActionExecutionOperator<Long, Object> operator =
+                    (ActionExecutionOperator<Long, Object>) testHarness.getOperator();
+
+            testHarness.processElement(new StreamRecord<>(0L));
+            assertThat(TestAgent.BOTH_SIBLING_ASYNC_STARTED.await(5, TimeUnit.SECONDS)).isTrue();
+
+            TestAgent.SIBLING_ACTION_B_ALLOW.countDown();
+            assertThat(TestAgent.SIBLING_B_ACTION_RETURNING.await(5, TimeUnit.SECONDS)).isTrue();
+            testHarness.getTaskMailbox().take(TaskMailbox.MIN_PRIORITY).run();
+            assertThat(testHarness.getRecordOutput()).isEmpty();
+
+            TestAgent.SIBLING_ACTION_A_ALLOW.countDown();
+            operator.waitInFlightEventsFinished();
+            List<StreamRecord<Object>> output =
+                    (List<StreamRecord<Object>>) testHarness.getRecordOutput();
+            assertThat(output)
+                    .extracting(StreamRecord::getValue)
+                    .containsExactly("sibling-A", "sibling-B");
+        } finally {
+            TestAgent.SIBLING_ACTION_A_ALLOW.countDown();
+            TestAgent.SIBLING_ACTION_B_ALLOW.countDown();
         }
     }
 
@@ -3581,6 +3931,11 @@ public class ActionExecutionOperatorTest {
             }
         }
 
+        public static void pendingEventsSingleAction(Event event, RunnerContext context) {
+            Long inputData = (Long) InputEvent.fromEvent(event).getInput();
+            context.sendEvent(new OutputEvent("single-" + inputData));
+        }
+
         private static <T> DurableCallable<T> reconcilableDurableCallable(
                 String id,
                 Class<T> resultClass,
@@ -3917,6 +4272,25 @@ public class ActionExecutionOperatorTest {
                                 new JavaFunction(
                                         TestAgent.class,
                                         "singleAsyncAction",
+                                        new Class<?>[] {Event.class, RunnerContext.class}),
+                                Collections.singletonList(InputEvent.EVENT_TYPE));
+                Map<String, Action> actions = new HashMap<>();
+                actions.put(action.getName(), action);
+                return new AgentPlan(actions, new HashMap<>(), config);
+            } catch (Exception e) {
+                ExceptionUtils.rethrow(e);
+            }
+            return null;
+        }
+
+        public static AgentPlan getPendingEventsSingleActionPlan(AgentConfiguration config) {
+            try {
+                Action action =
+                        new Action(
+                                "pending-events-single",
+                                new JavaFunction(
+                                        TestAgent.class,
+                                        "pendingEventsSingleAction",
                                         new Class<?>[] {Event.class, RunnerContext.class}),
                                 Collections.singletonList(InputEvent.EVENT_TYPE));
                 Map<String, Action> actions = new HashMap<>();

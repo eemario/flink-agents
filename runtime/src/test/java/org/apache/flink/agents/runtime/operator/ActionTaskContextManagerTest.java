@@ -19,6 +19,7 @@ package org.apache.flink.agents.runtime.operator;
 
 import org.apache.flink.agents.api.Event;
 import org.apache.flink.agents.api.InputEvent;
+import org.apache.flink.agents.api.OutputEvent;
 import org.apache.flink.agents.api.trace.ExecutionLifecycleEvents;
 import org.apache.flink.agents.api.trace.ExecutionReporter;
 import org.apache.flink.agents.plan.AgentPlan;
@@ -432,6 +433,28 @@ class ActionTaskContextManagerTest {
             assertThat(restored.getTraceContext()).isEqualTo(task.getTraceContext());
             assertThat(restored.hasExecutionStartedEventEmitted()).isTrue();
             assertThat(restored.getRunnerContext()).isNull();
+        }
+    }
+
+    @Test
+    void transferContextsSharesPendingEventsBufferWithGeneratedTask() throws Exception {
+        try (ActionTaskContextManager mgr = newManager()) {
+            Action action = TestActions.noopAction();
+            ActionTask from = new JavaActionTask("k", new InputEvent(1L), action, 1L);
+            ActionTask to = new JavaActionTask("k", new InputEvent(1L), action, 1L);
+
+            invokeCreateAndSetRunnerContext(mgr, from);
+            OutputEvent bufferedBeforeYield = new OutputEvent("before-yield");
+            from.getRunnerContext().sendEvent(bufferedBeforeYield);
+            List<Event> liveBuffer = from.getRunnerContext().getPendingEvents();
+
+            mgr.transferContexts(from, to, new DurableExecutionManager(null));
+            invokeCreateAndSetRunnerContext(mgr, to);
+
+            assertThat(to.getRunnerContext().getPendingEvents()).isSameAs(liveBuffer);
+            assertThat(to.getRunnerContext().drainEvents(null))
+                    .containsExactly(bufferedBeforeYield);
+            assertThat(liveBuffer).isEmpty();
         }
     }
 

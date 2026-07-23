@@ -61,6 +61,8 @@ import org.apache.flink.annotation.VisibleForTesting;
 import org.apache.flink.api.common.operators.MailboxExecutor;
 import org.apache.flink.api.common.typeinfo.TypeInformation;
 import org.apache.flink.api.common.typeutils.TypeSerializer;
+import org.apache.flink.runtime.checkpoint.CheckpointOptions;
+import org.apache.flink.runtime.state.CheckpointStreamFactory;
 import org.apache.flink.runtime.state.KeyGroupRange;
 import org.apache.flink.runtime.state.StateInitializationContext;
 import org.apache.flink.runtime.state.StateSnapshotContext;
@@ -69,6 +71,7 @@ import org.apache.flink.streaming.api.operators.AbstractStreamOperator;
 import org.apache.flink.streaming.api.operators.BoundedOneInput;
 import org.apache.flink.streaming.api.operators.ChainingStrategy;
 import org.apache.flink.streaming.api.operators.OneInputStreamOperator;
+import org.apache.flink.streaming.api.operators.OperatorSnapshotFutures;
 import org.apache.flink.streaming.api.operators.Output;
 import org.apache.flink.streaming.api.watermark.Watermark;
 import org.apache.flink.streaming.runtime.streamrecord.StreamRecord;
@@ -992,6 +995,51 @@ public class ActionExecutionOperator<IN, OUT> extends AbstractStreamOperator<OUT
 
     private TypeSerializer<?> getActionStateKeySerializer() {
         return getKeyedStateBackend().getKeySerializer();
+    }
+
+    @Override
+    public void prepareSnapshotPreBarrier(long checkpointId) throws Exception {
+        if (!parallelExecutionWithoutCoroutineEnabled) {
+            super.prepareSnapshotPreBarrier(checkpointId);
+            return;
+        }
+        // Quiesce pulled-but-uncommitted tasks before the barrier (their results only live in
+        // memory and would be lost on restore): pause dispatch, then yield without the lock
+        // until everything in flight has committed.
+        try {
+            executionCoordinator.startDraining();
+            while (!executionCoordinator.isQuiesced()) {
+                mailboxExecutor.yield();
+            }
+            super.prepareSnapshotPreBarrier(checkpointId);
+        } catch (Exception e) {
+            // A failed pre-barrier never reaches snapshotState's stopDraining; resume dispatch.
+            try {
+                executionCoordinator.stopDraining();
+            } catch (Exception resumeFailure) {
+                e.addSuppressed(resumeFailure);
+            }
+            throw e;
+        }
+    }
+
+    @Override
+    public OperatorSnapshotFutures snapshotState(
+            long checkpointId,
+            long timestamp,
+            CheckpointOptions checkpointOptions,
+            CheckpointStreamFactory storageLocation)
+            throws Exception {
+        if (!parallelExecutionWithoutCoroutineEnabled) {
+            return super.snapshotState(checkpointId, timestamp, checkpointOptions, storageLocation);
+        }
+        try {
+            return super.snapshotState(checkpointId, timestamp, checkpointOptions, storageLocation);
+        } finally {
+            // Resume dispatch only after the synchronous snapshot capture: a worker woken any
+            // earlier could pull a queued task out of keyed state before it is captured.
+            executionCoordinator.stopDraining();
+        }
     }
 
     @Override
