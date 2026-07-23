@@ -303,6 +303,16 @@ class AgentExecutionOptions:
         default=os.cpu_count() * 2,
     )
 
+    # Experimental fallback switch for the Java JDK<21 parallel execution engine.
+    # Only consulted for pure-Java agents without coroutine support; plans
+    # containing Python actions never use the parallel engine regardless of
+    # this value.
+    PARALLEL_EXECUTION_ENABLED = ConfigOption(
+        key="parallel-execution.enabled",
+        config_type=bool,
+        default=True,
+    )
+
     CHAT_ASYNC = ConfigOption(
         key="chat.async",
         config_type=bool,

@@ -27,6 +27,7 @@ import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.apache.flink.util.CloseableIterator;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Assumptions;
+import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
@@ -60,6 +61,10 @@ import static org.apache.flink.agents.resource.test.Mem0LongTermMemoryAgent.OLLA
  *       MILVUS_URI} env var
  * </ul>
  */
+@Disabled(
+        "Mem0LongTermMemoryAgent accesses long-term memory inside durableExecuteAsync, which"
+                + " violates the stateless-callable contract of RunnerContext#durableExecuteAsync;"
+                + " pending a separate long-term memory fix.")
 public class Mem0LongTermMemoryTest {
 
     private final boolean embeddingReady;

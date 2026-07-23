@@ -37,6 +37,7 @@ import org.apache.flink.agents.api.logger.EventLoggerFactory;
 import org.apache.flink.agents.api.logger.EventLoggerOpenParams;
 import org.apache.flink.agents.api.logger.LoggerType;
 import org.apache.flink.agents.api.memory.MemorySet;
+import org.apache.flink.agents.api.resource.ResourceDescriptor;
 import org.apache.flink.agents.api.resource.ResourceType;
 import org.apache.flink.agents.api.trace.ExecutionLifecycleEvents;
 import org.apache.flink.agents.api.trace.ExecutionReporter;
@@ -46,7 +47,9 @@ import org.apache.flink.agents.plan.AgentPlan;
 import org.apache.flink.agents.plan.JavaFunction;
 import org.apache.flink.agents.plan.actions.Action;
 import org.apache.flink.agents.plan.actions.ToolCallAction;
+import org.apache.flink.agents.plan.actions.Utils;
 import org.apache.flink.agents.plan.resourceprovider.JavaSerializableResourceProvider;
+import org.apache.flink.agents.plan.resourceprovider.PythonResourceProvider;
 import org.apache.flink.agents.plan.resourceprovider.ResourceProvider;
 import org.apache.flink.agents.plan.tools.FunctionTool;
 import org.apache.flink.agents.runtime.ResourceCache;
@@ -80,6 +83,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.InOrder;
 import org.mockito.MockedConstruction;
+import org.mockito.MockedStatic;
 
 import java.io.IOException;
 import java.io.Serializable;
@@ -106,6 +110,7 @@ import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.mockConstruction;
+import static org.mockito.Mockito.mockStatic;
 
 /** Tests for {@link ActionExecutionOperator}. */
 public class ActionExecutionOperatorTest {
@@ -229,6 +234,40 @@ public class ActionExecutionOperatorTest {
     }
 
     @Test
+    void pythonResourcesRequireAsyncCompatibleFlinkForParallelExecution() throws Exception {
+        AgentPlan allJava = TestAgent.getAgentPlan(false);
+        PythonResourceProvider pythonChatModel =
+                new PythonResourceProvider(
+                        "python-chat-model",
+                        ResourceType.CHAT_MODEL,
+                        new ResourceDescriptor("test.module", "TestChatModel", new HashMap<>()));
+        Map<String, ResourceProvider> chatModels = new HashMap<>();
+        chatModels.put("python-chat-model", pythonChatModel);
+        Map<ResourceType, Map<String, ResourceProvider>> resourceProviders = new HashMap<>();
+        resourceProviders.put(ResourceType.CHAT_MODEL, chatModels);
+        AgentPlan planWithPythonResource =
+                new AgentPlan(allJava.getActions(), resourceProviders, allJava.getConfig());
+
+        try (MockedStatic<Utils> utils = mockStatic(Utils.class)) {
+            utils.when(Utils::supportAsync).thenReturn(false);
+            assertThat(
+                            ActionExecutionOperator.shouldEnableParallelExecutionWithoutCoroutine(
+                                    allJava, false))
+                    .isTrue();
+            assertThat(
+                            ActionExecutionOperator.shouldEnableParallelExecutionWithoutCoroutine(
+                                    planWithPythonResource, false))
+                    .isFalse();
+
+            utils.when(Utils::supportAsync).thenReturn(true);
+            assertThat(
+                            ActionExecutionOperator.shouldEnableParallelExecutionWithoutCoroutine(
+                                    planWithPythonResource, false))
+                    .isTrue();
+        }
+    }
+
+    @Test
     void testSameKeyDataAreProcessedInOrder() throws Exception {
         try (KeyedOneInputStreamOperatorTestHarness<Long, Long, Object> testHarness =
                 new KeyedOneInputStreamOperatorTestHarness<>(
@@ -243,25 +282,15 @@ public class ActionExecutionOperatorTest {
             testHarness.processElement(new StreamRecord<>(0L));
             // Process input data 2, which has the same key (0)
             testHarness.processElement(new StreamRecord<>(0L));
-            // Since both pieces of data share the same key, we should consolidate them and process
-            // only input data 1.
-            // This means we need one mail to execute the action1 action for input data 1.
-            assertMailboxSizeAndRun(testHarness.getTaskMailbox(), 1);
-            // After executing this mail, we will have another mail to execute the action2 action
-            // for input data 1.
-            assertMailboxSizeAndRun(testHarness.getTaskMailbox(), 1);
-            // Once the above mails are executed, we should get a single output result from input
-            // data 1.
+            // Since both pieces of data share the same key, we should consolidate them: input
+            // data 2 is queued behind input data 1. Resident workers run the tasks and the
+            // worker-completion path drains the same-key queue in order; wait for it to finish.
+            operator.waitInFlightEventsFinished();
+            // Once the queued inputs finish in order, we should get two output results.
             List<StreamRecord<Object>> recordOutput =
                     (List<StreamRecord<Object>>) testHarness.getRecordOutput();
-            assertThat(recordOutput.size()).isEqualTo(1);
-            assertThat(recordOutput.get(0).getValue()).isEqualTo(2L);
-
-            // After the processing of input data 1 is finished, we can proceed to process input
-            // data 2 and obtain its result.
-            operator.waitInFlightEventsFinished();
-            recordOutput = (List<StreamRecord<Object>>) testHarness.getRecordOutput();
             assertThat(recordOutput.size()).isEqualTo(2);
+            assertThat(recordOutput.get(0).getValue()).isEqualTo(2L);
             assertThat(recordOutput.get(1).getValue()).isEqualTo(2L);
         }
     }
@@ -279,16 +308,14 @@ public class ActionExecutionOperatorTest {
             testHarness.processElement(new StreamRecord<>(0L));
             // Process input data 2, which has the different key (1)
             testHarness.processElement(new StreamRecord<>(1L));
-            // Since the two input data items have different keys, they can be processed in
-            // parallel.
-            // As a result, we should have two separate mails to execute the action1 for each of
-            // them.
-            assertMailboxSizeAndRun(testHarness.getTaskMailbox(), 2);
-            // After these two mails are executed, there should be another two mails — one for each
-            // input data item — to execute the corresponding action2.
-            assertMailboxSizeAndRun(testHarness.getTaskMailbox(), 2);
-            // Once both action2 operations are completed, we should receive two output data items,
-            // each corresponding to one of the original inputs.
+            // Since the two input data items have different keys, they can be processed in parallel
+            // by resident workers. Worker completion is asynchronous, so wait for the execution to
+            // drain instead of assuming both completions are queued at the same instant.
+            ActionExecutionOperator<Long, Object> operator =
+                    (ActionExecutionOperator<Long, Object>) testHarness.getOperator();
+            operator.waitInFlightEventsFinished();
+            // Once both action chains are completed, we should receive two output data items, each
+            // corresponding to one of the original inputs.
             List<StreamRecord<Object>> recordOutput =
                     (List<StreamRecord<Object>>) testHarness.getRecordOutput();
             assertThat(recordOutput.size()).isEqualTo(2);
@@ -315,7 +342,12 @@ public class ActionExecutionOperatorTest {
                         0)) {
             testHarness.open();
             testHarness.processElement(new StreamRecord<>(key));
-            assertThat(testHarness.getTaskMailbox().size()).isEqualTo(1);
+            // The input is now in flight (a processing key), so it is captured by the snapshot.
+            assertThat(
+                            ((ActionExecutionOperator<Long, Object>) testHarness.getOperator())
+                                    .getOperatorStateManager()
+                                    .getProcessingKeys())
+                    .containsExactly(key);
             snapshot = testHarness.snapshot(1L, 1L);
         }
 
@@ -357,8 +389,6 @@ public class ActionExecutionOperatorTest {
             ownerHarness.open();
             nonOwnerHarness.open();
 
-            assertThat(ownerHarness.getTaskMailbox().size()).isEqualTo(1);
-            assertThat(nonOwnerHarness.getTaskMailbox().size()).isZero();
             assertThat(
                             ((ActionExecutionOperator<Long, Object>) ownerHarness.getOperator())
                                     .getOperatorStateManager()
@@ -392,7 +422,12 @@ public class ActionExecutionOperatorTest {
                 restoredOwnerHarness.initializeState(secondRestoreOwnerState);
                 restoredOwnerHarness.open();
 
-                assertThat(restoredOwnerHarness.getTaskMailbox().size()).isEqualTo(1);
+                assertThat(
+                                ((ActionExecutionOperator<Long, Object>)
+                                                restoredOwnerHarness.getOperator())
+                                        .getOperatorStateManager()
+                                        .getProcessingKeys())
+                        .containsExactly(key);
             }
         }
     }
@@ -421,7 +456,12 @@ public class ActionExecutionOperatorTest {
                         TypeInformation.of(Long.class))) {
             testHarness.open();
             testHarness.processElement(new StreamRecord<>(key));
-            assertThat(testHarness.getTaskMailbox().size()).isEqualTo(1);
+            // The input is now in flight (a processing key), so it is captured by the snapshot.
+            assertThat(
+                            ((ActionExecutionOperator<Long, Object>) testHarness.getOperator())
+                                    .getOperatorStateManager()
+                                    .getProcessingKeys())
+                    .containsExactly(key);
             snapshot = testHarness.snapshot(1L, 1L);
         }
 
@@ -458,7 +498,12 @@ public class ActionExecutionOperatorTest {
                         TypeInformation.of(Long.class))) {
             testHarness.open();
             testHarness.processElement(new StreamRecord<>(key));
-            assertThat(testHarness.getTaskMailbox().size()).isEqualTo(1);
+            // The input is now in flight (a processing key), so it is captured by the snapshot.
+            assertThat(
+                            ((ActionExecutionOperator<Long, Object>) testHarness.getOperator())
+                                    .getOperatorStateManager()
+                                    .getProcessingKeys())
+                    .containsExactly(key);
             snapshot = testHarness.snapshot(1L, 1L);
         }
 
@@ -499,7 +544,7 @@ public class ActionExecutionOperatorTest {
             assertThatThrownBy(() -> operator.waitInFlightEventsFinished())
                     .hasCauseInstanceOf(ActionExecutionOperator.ActionTaskExecutionException.class)
                     .rootCause()
-                    .hasMessageContaining("Expected to be running on the task mailbox thread");
+                    .hasMessageContaining("Current thread does not own the lock");
         }
     }
 
@@ -652,9 +697,11 @@ public class ActionExecutionOperatorTest {
             // same buffer directly rather than duplicating the Python LTM record schema here.
             assertThat(ltm.pendingObservationKeys()).isEmpty();
             assertThat(ltm.drainedObservationKeys()).containsExactly("0");
-            assertThat(ltm.drainCallCount()).isEqualTo(1);
-            // The failed mailbox task cannot continue to the following action in this operator.
-            assertThat(TestAgent.FOLLOWING_ACTION_EXECUTED).isFalse();
+            // Parallel engine: same-event actions are dispatched independently, so a sibling
+            // failure does not abort the following same-key action. It still runs and drains once
+            // more on finish (a no-op flush), totalling two drains where serial would drain once.
+            assertThat(ltm.drainCallCount()).isEqualTo(2);
+            assertThat(TestAgent.FOLLOWING_ACTION_EXECUTED).isTrue();
         }
     }
 
@@ -684,8 +731,11 @@ public class ActionExecutionOperatorTest {
                     .hasMessageContaining("first action failed after LTM");
             assertThat(findSuppressedFailure(thrown, discardFailure)).isSameAs(discardFailure);
             assertThat(ltm.recordedKeys()).containsExactly("0");
-            assertThat(ltm.drainCallCount()).isEqualTo(1);
-            assertThat(TestAgent.FOLLOWING_ACTION_EXECUTED).isFalse();
+            // Parallel engine: the same-event sibling following action is dispatched independently
+            // and is not aborted by the failing action, so it also runs and drains on finish. The
+            // failing action's discard plus that flush total two drain calls.
+            assertThat(ltm.drainCallCount()).isEqualTo(2);
+            assertThat(TestAgent.FOLLOWING_ACTION_EXECUTED).isTrue();
         }
     }
 
@@ -1479,7 +1529,8 @@ public class ActionExecutionOperatorTest {
             actionStateStore.clearPruneCalls();
 
             testHarness.processElement(new StreamRecord<>(5L));
-            assertThat(testHarness.getTaskMailbox().size()).isEqualTo(1);
+            // The second input is now in flight (a processing key) but not yet completed.
+            assertThat(operator.getOperatorStateManager().getProcessingKeys()).containsExactly(5L);
 
             testHarness.snapshot(1L, 1L);
             testHarness.notifyOfCompletedCheckpoint(1L);

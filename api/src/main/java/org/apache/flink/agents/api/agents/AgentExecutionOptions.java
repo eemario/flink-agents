@@ -39,6 +39,15 @@ public class AgentExecutionOptions {
                     Integer.class,
                     Runtime.getRuntime().availableProcessors() * 2);
 
+    /**
+     * Experimental fallback switch for the JDK&lt;21 parallel execution engine. Only consulted for
+     * pure-Java agents without coroutine support; the JDK 21 coroutine engine and plans containing
+     * Python actions never use the parallel engine regardless of this value (no Python-side
+     * counterpart exists by design). Set to {@code false} to fall back to the serial engine.
+     */
+    public static final ConfigOption<Boolean> PARALLEL_EXECUTION_ENABLED =
+            new ConfigOption<>("parallel-execution.enabled", Boolean.class, true);
+
     public static final ConfigOption<Boolean> CHAT_ASYNC =
             new ConfigOption<>("chat.async", Boolean.class, true);
 
