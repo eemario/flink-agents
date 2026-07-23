@@ -21,6 +21,7 @@ import org.apache.flink.agents.api.Event;
 import org.apache.flink.agents.api.InputEvent;
 import org.apache.flink.agents.api.OutputEvent;
 import org.apache.flink.agents.api.agents.AgentExecutionOptions;
+import org.apache.flink.agents.api.context.RunnerContext;
 import org.apache.flink.agents.api.event.AgentRunBeginEvent;
 import org.apache.flink.agents.api.resource.Resource;
 import org.apache.flink.agents.api.resource.ResourceName;
@@ -84,6 +85,7 @@ import javax.annotation.Nullable;
 
 import java.lang.reflect.Field;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -118,6 +120,35 @@ public class ActionExecutionOperator<IN, OUT> extends AbstractStreamOperator<OUT
 
     /** Idle time after which a surplus parallel-execution worker thread retires (min pool is 1). */
     private static final long WORKER_IDLE_TIMEOUT_MS = 60_000L;
+
+    private static final String INTERNAL_NOOP_INPUT_ACTION_NAME =
+            "__flink_agents_internal_noop_input_action";
+
+    private static final Action INTERNAL_NOOP_INPUT_ACTION = createInternalNoopInputAction();
+
+    private static Action createInternalNoopInputAction() {
+        try {
+            return new Action(
+                    INTERNAL_NOOP_INPUT_ACTION_NAME,
+                    new JavaFunction(
+                            InternalNoopInputAction.class,
+                            "run",
+                            new Class<?>[] {Event.class, RunnerContext.class}),
+                    Collections.singletonList(InputEvent.EVENT_TYPE));
+        } catch (Exception e) {
+            throw new ExceptionInInitializerError(e);
+        }
+    }
+
+    private static boolean isInternalNoopInputAction(Action action) {
+        return INTERNAL_NOOP_INPUT_ACTION_NAME.equals(action.getName());
+    }
+
+    public static final class InternalNoopInputAction {
+        public static void run(Event event, RunnerContext ctx) {}
+
+        private InternalNoopInputAction() {}
+    }
 
     static boolean shouldEnableParallelExecutionWithoutCoroutine(
             AgentPlan agentPlan, boolean continuationSupported) {
@@ -171,6 +202,19 @@ public class ActionExecutionOperator<IN, OUT> extends AbstractStreamOperator<OUT
     @Nullable private transient ParallelExecutionLock parallelExecutionLock;
 
     @Nullable private transient ParallelExecutionCoordinator executionCoordinator;
+
+    /**
+     * Number of input records currently being processed (one per active key), compared against
+     * {@link #maxInFlightInputRecords} to apply input backpressure. Maintained on the mailbox
+     * thread alongside {@code addProcessingKey}/{@code removeProcessingKey} and rebuilt from the
+     * recovered processing keys.
+     */
+    private transient int inFlightInputRecords;
+
+    /**
+     * Configured cap on concurrently processed input records; see {@link #inFlightInputRecords}.
+     */
+    private int maxInFlightInputRecords;
 
     // Long-term memory backed by Mem0; non-null only when LongTermMemoryOptions.Mem0 is configured.
     private transient Mem0LongTermMemory ltm;
@@ -282,6 +326,14 @@ public class ActionExecutionOperator<IN, OUT> extends AbstractStreamOperator<OUT
                 "%s must be positive, but was %s",
                 AgentExecutionOptions.NUM_ASYNC_THREADS.getKey(),
                 numAsyncThreads);
+
+        maxInFlightInputRecords =
+                agentPlan.getConfig().get(AgentExecutionOptions.MAX_IN_FLIGHT_INPUT_RECORDS);
+        checkArgument(
+                maxInFlightInputRecords > 0,
+                "%s must be positive, but was %s",
+                AgentExecutionOptions.MAX_IN_FLIGHT_INPUT_RECORDS.getKey(),
+                maxInFlightInputRecords);
 
         parallelExecutionWithoutCoroutineEnabled =
                 shouldEnableParallelExecutionWithoutCoroutine(
@@ -398,6 +450,18 @@ public class ActionExecutionOperator<IN, OUT> extends AbstractStreamOperator<OUT
         if (parallelExecutionWithoutCoroutineEnabled) {
             runWithParallelExecutionLock(
                     () -> {
+                        // Soft backpressure BEFORE establishing the key: yields may change the
+                        // current key, so the record's key is set after the last yield. Release
+                        // around yield (non-reentrant lock); re-acquire in finally for the outer
+                        // release.
+                        while (inFlightInputRecords >= maxInFlightInputRecords) {
+                            parallelExecutionLock.release();
+                            try {
+                                mailboxExecutor.yield();
+                            } finally {
+                                parallelExecutionLock.acquireByMain();
+                            }
+                        }
                         super.setKeyContextElement1(record);
                         processElementInternal(record);
                     });
@@ -407,6 +471,10 @@ public class ActionExecutionOperator<IN, OUT> extends AbstractStreamOperator<OUT
     }
 
     private void processElementInternal(StreamRecord<IN> record) throws Exception {
+        // Every admitted input record consumes one unit of in-flight budget, regardless of whether
+        // it activates a new key or queues behind an in-flight record for an already-active key.
+        // The matching decrement happens when that record's processing finishes.
+        inFlightInputRecords++;
         IN input = record.getValue();
         LOG.debug("Receive an element {}", input);
 
@@ -505,6 +573,15 @@ public class ActionExecutionOperator<IN, OUT> extends AbstractStreamOperator<OUT
                         executionCoordinator.addTask(key);
                     }
                 }
+            } else if (isInputEvent && parallelExecutionWithoutCoroutineEnabled) {
+                stateManager.addActionTask(
+                        createActionTask(
+                                key,
+                                INTERNAL_NOOP_INPUT_ACTION,
+                                event,
+                                stateManager.getSequenceNumber(),
+                                traceContext));
+                executionCoordinator.addTask(key);
             }
         }
 
@@ -593,6 +670,7 @@ public class ActionExecutionOperator<IN, OUT> extends AbstractStreamOperator<OUT
         lastCommitted.actionTask.getRunnerContext().clearSensoryMemory();
         durableExecManager.updateLastCompletedSequenceNumber(lastCommitted.sequenceNumber);
         int removedCount = stateManager.removeProcessingKey(key);
+        inFlightInputRecords--;
         checkState(
                 removedCount == 1,
                 "Current processing key count for key "
@@ -616,6 +694,7 @@ public class ActionExecutionOperator<IN, OUT> extends AbstractStreamOperator<OUT
         ActionTask actionTask = stateManager.pollNextActionTask();
         if (actionTask == null) {
             int removedCount = stateManager.removeProcessingKey(key);
+            inFlightInputRecords--;
             checkState(
                     removedCount == 1,
                     "Current processing key count for key "
@@ -779,6 +858,7 @@ public class ActionExecutionOperator<IN, OUT> extends AbstractStreamOperator<OUT
             // Once all sub-events and actions related to the current InputEvent are completed,
             // we can proceed to process the next InputEvent.
             int removedCount = stateManager.removeProcessingKey(key);
+            inFlightInputRecords--;
             checkState(
                     removedCount == 1,
                     "Current processing key count for key "
@@ -1176,18 +1256,24 @@ public class ActionExecutionOperator<IN, OUT> extends AbstractStreamOperator<OUT
                 }
             }
             stateManager.replaceProcessingKeys(new ArrayList<>(ownedKeys));
+            // Each recovered key has one active input record occupying in-flight budget; queued
+            // pending records for these keys are added below.
+            inFlightInputRecords = ownedKeys.size();
         }
 
-        // Re-enqueue recovered pending input records so they are dequeued and processed.
+        // Recovered pending input records will each be dequeued, processed, and decremented when
+        // they finish, so they must occupy in-flight budget too — count one unit per pending event.
         stateManager.forEachPendingInputEventKey(
                 getKeyedStateBackend(),
                 (key, state) ->
                         state.get()
                                 .forEach(
-                                        event ->
-                                                eventRouter
-                                                        .getKeySegmentQueue()
-                                                        .addKeyToLastSegment(key)));
+                                        event -> {
+                                            inFlightInputRecords++;
+                                            eventRouter
+                                                    .getKeySegmentQueue()
+                                                    .addKeyToLastSegment(key);
+                                        }));
     }
 
     private void runWithParallelExecutionLock(ThrowingRunnable<? extends Exception> action)
@@ -1398,7 +1484,9 @@ public class ActionExecutionOperator<IN, OUT> extends AbstractStreamOperator<OUT
                 }
             }
 
-            builtInMetrics.markActionExecuted(actionTask.action.getName());
+            if (!isInternalNoopInputAction(actionTask.action)) {
+                builtInMetrics.markActionExecuted(actionTask.action.getName());
+            }
             actionTask.getRunnerContext().persistMemory();
         }
 
