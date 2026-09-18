@@ -1097,9 +1097,15 @@ public class ActionExecutionOperatorTest {
                                 new Class<?>[] {Event.class, RunnerContext.class}),
                         Collections.singletonList(InputEvent.EVENT_TYPE),
                         Collections.singletonMap("mode", "strict"));
+        // Force serial: the parallel engine drains all in-flight tasks before checkpoint, so no
+        // pending task survives the snapshot — this test exercises the serial restore contract.
+        AgentConfiguration serialConfig = new AgentConfiguration();
+        serialConfig.set(AgentExecutionOptions.PARALLEL_EXECUTION_ENABLED, false);
         AgentPlan agentPlan =
                 new AgentPlan(
-                        Collections.singletonMap(configuredAction.getName(), configuredAction));
+                        Collections.singletonMap(configuredAction.getName(), configuredAction),
+                        new HashMap<>(),
+                        serialConfig);
 
         OperatorSubtaskState snapshot;
         try (KeyedOneInputStreamOperatorTestHarness<Long, Long, Object> testHarness =
@@ -1139,7 +1145,14 @@ public class ActionExecutionOperatorTest {
 
     @Test
     void testRestoredActionUsesSameTextualContextKeyForLtmWriteAndCleanup() throws Exception {
+        // Force serial: the parallel engine drains in-flight tasks before checkpoint, so the
+        // failing action would execute and fail during drain rather than surviving to restore.
         AgentPlan agentPlan = TestAgent.getFailedActionAfterLtmAgentPlan();
+        AgentConfiguration serialConfig = new AgentConfiguration();
+        serialConfig.set(AgentExecutionOptions.PARALLEL_EXECUTION_ENABLED, false);
+        agentPlan =
+                new AgentPlan(
+                        agentPlan.getActions(), agentPlan.getResourceProviders(), serialConfig);
         OperatorSubtaskState snapshot;
         long key = 1L << 32;
         String expectedContextKey = "4294967296";
@@ -1327,10 +1340,13 @@ public class ActionExecutionOperatorTest {
     @Test
     void testFailedActionAfterLtmDiscardsCurrentKeyBeforeRethrowing() throws Exception {
         RecordingMem0LongTermMemory ltm = new RecordingMem0LongTermMemory();
+        AgentPlan agentPlan = TestAgent.getFailedActionAfterLtmAgentPlan();
+        // Verify the serial drain path: the failing action discards its observation exactly once,
+        // and the following same-key action never executes.
+        agentPlan.getConfig().set(AgentExecutionOptions.PARALLEL_EXECUTION_ENABLED, false);
         try (KeyedOneInputStreamOperatorTestHarness<String, Long, Object> testHarness =
                 new KeyedOneInputStreamOperatorTestHarness<>(
-                        new ActionExecutionOperatorFactory(
-                                TestAgent.getFailedActionAfterLtmAgentPlan(), true),
+                        new ActionExecutionOperatorFactory(agentPlan, true),
                         (KeySelector<Long, String>) String::valueOf,
                         TypeInformation.of(String.class))) {
             testHarness.open();
@@ -1350,11 +1366,9 @@ public class ActionExecutionOperatorTest {
             // same buffer directly rather than duplicating the Python LTM record schema here.
             assertThat(ltm.pendingObservationKeys()).isEmpty();
             assertThat(ltm.drainedObservationKeys()).containsExactly("0");
-            // Parallel engine: same-event actions are dispatched independently, so a sibling
-            // failure does not abort the following same-key action. It still runs and drains once
-            // more on finish (a no-op flush), totalling two drains where serial would drain once.
-            assertThat(ltm.drainCallCount()).isEqualTo(2);
-            assertThat(TestAgent.FOLLOWING_ACTION_EXECUTED).isTrue();
+            assertThat(ltm.drainCallCount()).isEqualTo(1);
+            // The failed mailbox task cannot continue to the following action in this operator.
+            assertThat(TestAgent.FOLLOWING_ACTION_EXECUTED).isFalse();
         }
     }
 
@@ -1364,10 +1378,13 @@ public class ActionExecutionOperatorTest {
         RuntimeException discardFailure = new RuntimeException("discard failed");
         ltm.failDrainWith(discardFailure);
 
+        AgentPlan agentPlan = TestAgent.getFailedActionAfterLtmAgentPlan();
+        // Verify on the serial path that a discard failure is suppressed rather than replacing
+        // the original action failure.
+        agentPlan.getConfig().set(AgentExecutionOptions.PARALLEL_EXECUTION_ENABLED, false);
         try (KeyedOneInputStreamOperatorTestHarness<String, Long, Object> testHarness =
                 new KeyedOneInputStreamOperatorTestHarness<>(
-                        new ActionExecutionOperatorFactory(
-                                TestAgent.getFailedActionAfterLtmAgentPlan(), true),
+                        new ActionExecutionOperatorFactory(agentPlan, true),
                         (KeySelector<Long, String>) String::valueOf,
                         TypeInformation.of(String.class))) {
             testHarness.open();
@@ -1384,11 +1401,8 @@ public class ActionExecutionOperatorTest {
                     .hasMessageContaining("first action failed after LTM");
             assertThat(findSuppressedFailure(thrown, discardFailure)).isSameAs(discardFailure);
             assertThat(ltm.recordedKeys()).containsExactly("0");
-            // Parallel engine: the same-event sibling following action is dispatched independently
-            // and is not aborted by the failing action, so it also runs and drains on finish. The
-            // failing action's discard plus that flush total two drain calls.
-            assertThat(ltm.drainCallCount()).isEqualTo(2);
-            assertThat(TestAgent.FOLLOWING_ACTION_EXECUTED).isTrue();
+            assertThat(ltm.drainCallCount()).isEqualTo(1);
+            assertThat(TestAgent.FOLLOWING_ACTION_EXECUTED).isFalse();
         }
     }
 

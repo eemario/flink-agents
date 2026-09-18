@@ -459,6 +459,43 @@ class ActionTaskContextManagerTest {
     }
 
     @Test
+    void transferContextsRecreatesIdentityContinuationContextsAfterCleanup() throws Exception {
+        DurableExecutionManager durableManager =
+                new DurableExecutionManager(new InMemoryActionStateStore(false));
+        try (ActionTaskContextManager mgr = newManager(durableManager)) {
+            Action action = TestActions.noopAction();
+            InputEvent event = new InputEvent(1L);
+            ActionTask task = new JavaActionTask("k", event, action, 1L);
+
+            invokeCreateAndSetRunnerContext(mgr, task);
+            RunnerContextImpl.MemoryContext memoryContext =
+                    task.getRunnerContext().getMemoryContext();
+            ContinuationContext continuationContext =
+                    ((JavaRunnerContextImpl) task.getRunnerContext()).getContinuationContext();
+            List<Event> pendingEvents = task.getRunnerContext().getPendingEvents();
+
+            durableManager.setupDurableExecutionContext(task, new ActionState(event), 0L);
+            RunnerContextImpl.DurableExecutionContext durableContext =
+                    task.getRunnerContext().getDurableExecutionContext();
+
+            // Python generator continuations return `this` as the generated task, so from==to.
+            // Verify the remove-then-transfer-to-self cycle preserves all context instances.
+            mgr.removeContexts(task);
+            durableManager.removeDurableContext(task);
+            mgr.transferContexts(task, task, durableManager);
+            invokeCreateAndSetRunnerContext(mgr, task);
+
+            assertThat(task.getRunnerContext().getMemoryContext()).isSameAs(memoryContext);
+            assertThat(((JavaRunnerContextImpl) task.getRunnerContext()).getContinuationContext())
+                    .isSameAs(continuationContext);
+            assertThat(task.getRunnerContext().getPendingEvents()).isSameAs(pendingEvents);
+            assertThat(durableManager.getDurableContext(task)).isSameAs(durableContext);
+            assertThat(task.getRunnerContext().getDurableExecutionContext())
+                    .isSameAs(durableContext);
+        }
+    }
+
+    @Test
     void transferContextsRoutesDurableContextThroughManager() throws Exception {
         try (ActionTaskContextManager mgr = newManager()) {
             Action action = TestActions.noopAction();

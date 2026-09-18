@@ -104,11 +104,14 @@ public class ContinuationActionExecutor {
 
     /**
      * Executes all suppliers as one batch. In JDK 11, this falls back to serial execution and
-     * captures each supplier's success or failure as an {@link Outcome}.
+     * captures each supplier's success or failure as an {@link Outcome}. When invoked by the
+     * parallel engine, the whole batch runs without the shared operator lock and the task context
+     * is restored after worker ownership is re-acquired.
      *
      * @param context the continuation context
      * @param suppliers the suppliers to execute
      * @param timeout ignored in the JDK 11 fallback
+     * @param maxParallelism ignored in the JDK 11 fallback
      * @param <T> the result type
      * @return outcomes in supplier order
      */
@@ -116,7 +119,23 @@ public class ContinuationActionExecutor {
             ContinuationContext context,
             List<Callable<T>> suppliers,
             Duration timeout,
-            int maxParallelism) {
+            int maxParallelism)
+            throws Exception {
+        if (parallelExecutionLock == null || suppliers.isEmpty()) {
+            return executeSuppliers(suppliers);
+        }
+
+        parallelExecutionLock.checkReentrant();
+        parallelExecutionLock.release();
+        try {
+            return executeSuppliers(suppliers);
+        } finally {
+            parallelExecutionLock.acquireByWorker(context.getRecordIndex(), context.getTaskIndex());
+            contextRestorer.restore(context.getKey(), context.getActionTask());
+        }
+    }
+
+    private static <T> BatchExecutionResult<T> executeSuppliers(List<Callable<T>> suppliers) {
         List<Outcome<T>> outcomes =
                 suppliers.stream()
                         .map(

@@ -21,6 +21,8 @@ import org.apache.flink.agents.runtime.operator.parallel.ParallelExecutionContex
 import org.apache.flink.agents.runtime.operator.parallel.ParallelExecutionLock;
 import org.junit.jupiter.api.Test;
 
+import java.util.List;
+import java.util.concurrent.Callable;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -83,6 +85,64 @@ class ContinuationActionExecutorTest {
 
             allowSupplierToFinish.countDown();
             assertThat(workerResult.get(5, TimeUnit.SECONDS)).isEqualTo("result");
+            assertThat(restored).isTrue();
+        } finally {
+            workerExecutor.shutdownNow();
+            executor.close();
+        }
+    }
+
+    @Test
+    void executeAllAsyncReleasesAndReacquiresLockAndRestoresContext() throws Exception {
+        ParallelExecutionLock lock = new ParallelExecutionLock();
+        AtomicBoolean restored = new AtomicBoolean();
+        ParallelExecutionContextRestorer restorer =
+                (key, action) -> {
+                    lock.checkReentrant();
+                    restored.set(true);
+                };
+        ContinuationActionExecutor executor =
+                new ContinuationActionExecutor(1, () -> {}, lock, restorer);
+        ContinuationContext context = new ContinuationContext();
+        CountDownLatch supplierStarted = new CountDownLatch(1);
+        CountDownLatch allowSupplierToFinish = new CountDownLatch(1);
+        List<Callable<String>> suppliers =
+                List.of(
+                        () -> {
+                            supplierStarted.countDown();
+                            await(allowSupplierToFinish);
+                            return "first";
+                        },
+                        () -> "second");
+
+        ExecutorService workerExecutor = Executors.newSingleThreadExecutor();
+        try {
+            Future<BatchExecutionResult<String>> workerResult =
+                    workerExecutor.submit(
+                            () -> {
+                                lock.acquireByWorker(0, 0);
+                                try {
+                                    return executor.executeAllAsync(
+                                            context, suppliers, null, suppliers.size());
+                                } finally {
+                                    lock.release();
+                                }
+                            });
+
+            assertThat(supplierStarted.await(5, TimeUnit.SECONDS)).isTrue();
+
+            lock.acquireByMain();
+            try {
+                lock.checkReentrant();
+            } finally {
+                lock.release();
+            }
+            assertThat(restored).isFalse();
+
+            allowSupplierToFinish.countDown();
+            BatchExecutionResult<String> result = workerResult.get(5, TimeUnit.SECONDS);
+            assertThat(result.getOutcomes().get(0).getValue()).isEqualTo("first");
+            assertThat(result.getOutcomes().get(1).getValue()).isEqualTo("second");
             assertThat(restored).isTrue();
         } finally {
             workerExecutor.shutdownNow();

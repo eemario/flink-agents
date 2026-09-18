@@ -672,6 +672,10 @@ public class ActionExecutionOperator<IN, OUT> extends AbstractStreamOperator<OUT
 
         lastCommitted.actionTask.getRunnerContext().clearSensoryMemory();
         durableExecManager.updateLastCompletedSequenceNumber(lastCommitted.sequenceNumber);
+        // Mirror the serial path: notify record finished. Noop rounds stay silent.
+        if (!isInternalNoopInputAction(lastCommitted.actionTask.action)) {
+            notifyRecordFinished(key);
+        }
         int removedCount = stateManager.removeProcessingKey(key);
         inFlightInputRecords--;
         checkState(
@@ -1388,6 +1392,12 @@ public class ActionExecutionOperator<IN, OUT> extends AbstractStreamOperator<OUT
                         ltm,
                         ActionExecutionOperator.this::createComponentListeners);
 
+                // The synthetic noop input action stays lifecycle-silent.
+                boolean lifecycleVisible = !isInternalNoopInputAction(task.action);
+                if (lifecycleVisible) {
+                    notifyActionPrepared(task);
+                }
+
                 long seq = stateManager.getSequenceNumber();
                 ActionState state =
                         durableExecManager.maybeGetActionState(key, seq, task.action, task.event);
@@ -1420,35 +1430,43 @@ public class ActionExecutionOperator<IN, OUT> extends AbstractStreamOperator<OUT
 
                 // Run: replay a durably-completed action from its persisted state, or invoke it.
                 if (replay) {
-                    // Mirror the serial replay path: reapply persisted updates through the
-                    // replayer (raw MemoryObject.set rejects overwrites/immutable collections).
                     MemoryUpdateReplayer.replay(
                             task.getRunnerContext().getShortTermMemory(),
                             state.getShortTermMemoryUpdates());
                     MemoryUpdateReplayer.replay(
                             task.getRunnerContext().getSensoryMemory(),
                             state.getSensoryMemoryUpdates());
+                    if (lifecycleVisible) {
+                        notifyActionReused(task);
+                    }
                     result = task.new ActionTaskResult(true, state.getOutputEvents(), null);
                 } else {
-                    // Mirror the serial path: a Java task needs the event serializer to resolve
-                    // attachment references before it invokes.
-                    if (task instanceof JavaActionTask) {
-                        ((JavaActionTask) task).setEventSerializer(eventSerializer);
+                    if (lifecycleVisible) {
+                        notifyActionStarted(task);
                     }
                     try {
+                        if (task instanceof JavaActionTask) {
+                            ((JavaActionTask) task).setEventSerializer(eventSerializer);
+                        }
                         result =
                                 task.invoke(
                                         getRuntimeContext().getUserCodeClassLoader(),
                                         pythonBridge.getPythonActionExecutor());
                     } catch (Throwable actionFailure) {
-                        // Mirror the serial invoke-failure path: discard the in-flight memory
-                        // observation (suppressing any discard failure) before the failure
-                        // propagates to commit() on the mailbox thread.
                         try {
                             task.getRunnerContext().discardMemoryObservation();
                         } catch (Throwable discardFailure) {
                             if (discardFailure != actionFailure) {
                                 actionFailure.addSuppressed(discardFailure);
+                            }
+                        }
+                        if (lifecycleVisible) {
+                            try {
+                                notifyActionFailed(task, actionFailure);
+                            } catch (Throwable notifyFailure) {
+                                if (notifyFailure != actionFailure) {
+                                    actionFailure.addSuppressed(notifyFailure);
+                                }
                             }
                         }
                         throw actionFailure;
@@ -1480,12 +1498,6 @@ public class ActionExecutionOperator<IN, OUT> extends AbstractStreamOperator<OUT
         @Override
         public void commit() throws Exception {
             if (failure != null) {
-                // The action began executing on the worker; mirror the serial path by reporting
-                // started (once) then failed on the mailbox thread before propagating.
-                if (actionTask != null) {
-                    notifyActionStarted(actionTask);
-                    notifyActionFailed(actionTask, failure);
-                }
                 throw new ActionTaskExecutionException("Failed to execute action task", failure);
             }
             checkState(result != null, "Action task completion result must not be null.");
@@ -1497,27 +1509,32 @@ public class ActionExecutionOperator<IN, OUT> extends AbstractStreamOperator<OUT
                     "Parallel-engine action did not finish in one invoke: %s",
                     actionTask.action.getName());
 
-            // Lifecycle events fire here on the mailbox thread (never on the worker), mirroring the
-            // serial path: started|reused -> remove -> finishing -> persist -> finished ->
-            // processEvent -> markExecuted + persistMemory.
-            if (replayCompletedAction) {
-                notifyActionReused(actionTask);
-            } else {
-                notifyActionStarted(actionTask);
-            }
-            contextManager.removeContexts(actionTask);
-            durableExecManager.removeDurableContext(actionTask);
+            // The synthetic noop input action stays lifecycle-silent.
+            boolean lifecycleVisible = !isInternalNoopInputAction(actionTask.action);
+            try {
+                contextManager.removeContexts(actionTask);
+                durableExecManager.removeDurableContext(actionTask);
 
-            if (!replayCompletedAction) {
-                notifyActionFinishing(actionTask);
-                durableExecManager.maybePersistTaskResult(
-                        key,
-                        sequenceNumber,
-                        actionTask.action,
-                        actionTask.event,
-                        actionTask.getRunnerContext(),
-                        result);
-                notifyActionFinished(actionTask);
+                if (!replayCompletedAction) {
+                    if (lifecycleVisible) {
+                        notifyActionFinishing(actionTask);
+                    }
+                    durableExecManager.maybePersistTaskResult(
+                            key,
+                            sequenceNumber,
+                            actionTask.action,
+                            actionTask.event,
+                            actionTask.getRunnerContext(),
+                            result);
+                    if (lifecycleVisible) {
+                        notifyActionFinished(actionTask);
+                    }
+                }
+            } catch (Throwable t) {
+                if (lifecycleVisible) {
+                    notifyActionFailed(actionTask, t);
+                }
+                throw new ActionTaskExecutionException("Failed to execute action task", t);
             }
 
             for (Event actionOutputEvent : result.getOutputEvents()) {
