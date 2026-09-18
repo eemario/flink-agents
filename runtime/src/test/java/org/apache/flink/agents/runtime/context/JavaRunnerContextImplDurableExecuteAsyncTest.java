@@ -691,7 +691,7 @@ class JavaRunnerContextImplDurableExecuteAsyncTest {
         private ExecutorService batchExecutor = Executors.newFixedThreadPool(4);
 
         private InspectingContinuationActionExecutor() {
-            super(1);
+            super(1, () -> {}, null, null);
         }
 
         @Override
