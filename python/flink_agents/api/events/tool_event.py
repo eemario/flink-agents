@@ -26,10 +26,11 @@ from uuid import UUID
 
 from flink_agents.api.chat_message import ToolCallBlock
 from flink_agents.api.events.event import BuiltInAttribute, Event
+from flink_agents.api.events.request_response_event import RequestResponseEvent
 from flink_agents.api.tools.tool_response import ToolResponse
 
 
-class ToolRequestEvent(Event):
+class ToolRequestEvent(RequestResponseEvent):
     """Event representing a tool call request.
 
     Attributes:
@@ -43,19 +44,27 @@ class ToolRequestEvent(Event):
     EVENT_TYPE: ClassVar[str] = "_tool_request_event"
 
     _ATTRIBUTE_SCHEMA: ClassVar[Tuple[BuiltInAttribute, ...]] = (
+        BuiltInAttribute.optional("request_context", dict),
         BuiltInAttribute.required("model", str),
         BuiltInAttribute.required_list(
             "tool_calls", "a tool call", (dict, ToolCallBlock)
         ),
     )
 
-    def __init__(self, model: str, tool_calls: List[ToolCallBlock]) -> None:
+    def __init__(
+        self,
+        model: str,
+        tool_calls: List[ToolCallBlock],
+        *,
+        request_context: dict[str, Any] | None = None,
+    ) -> None:
         """Create a ToolRequestEvent."""
         tool_calls = [ToolCallBlock.model_validate(c) for c in tool_calls]
         if len({c.call_id for c in tool_calls}) != len(tool_calls):
             msg = "Duplicate tool call ID in one request"
             raise ValueError(msg)
         super().__init__(
+            request_context=request_context,
             type=ToolRequestEvent.EVENT_TYPE,
             attributes={
                 "model": model,
@@ -86,7 +95,7 @@ class ToolRequestEvent(Event):
         return self.get_attr("tool_calls")
 
 
-class ToolResponseEvent(Event):
+class ToolResponseEvent(RequestResponseEvent):
     """Event representing a result from tool call.
 
     Attributes:
@@ -100,6 +109,7 @@ class ToolResponseEvent(Event):
     EVENT_TYPE: ClassVar[str] = "_tool_response_event"
 
     _ATTRIBUTE_SCHEMA: ClassVar[Tuple[BuiltInAttribute, ...]] = (
+        BuiltInAttribute.optional("request_context", dict),
         BuiltInAttribute.required_uuid("request_id"),
         BuiltInAttribute.required("responses", dict),
         BuiltInAttribute.optional("success", dict),
@@ -116,6 +126,8 @@ class ToolResponseEvent(Event):
         responses: Dict[str, Any],
         success: Dict[str, bool] | None = None,
         error: Dict[str, str] | None = None,
+        *,
+        request_context: dict[str, Any] | None = None,
     ) -> None:
         """Create a ToolResponseEvent."""
         responses = {
@@ -135,6 +147,7 @@ class ToolResponseEvent(Event):
         if success is None:
             success = {k: v.is_success() for k, v in responses.items()}
         super().__init__(
+            request_context=request_context,
             type=ToolResponseEvent.EVENT_TYPE,
             attributes={
                 "request_id": request_id,

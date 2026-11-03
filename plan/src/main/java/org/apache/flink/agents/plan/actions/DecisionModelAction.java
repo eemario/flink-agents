@@ -159,7 +159,8 @@ public final class DecisionModelAction {
                 int waitSec = waitInterval * (1 << retryCount);
                 retryCount++;
                 LOG.warn(
-                        "Decision request {} failed with error: {}, retrying {} / {}, waiting {} s.",
+                        "Decision request {} failed with error: {}, retrying {} / {}, waiting {}"
+                                + " s.",
                         request.getId(),
                         outcome.error,
                         retryCount,
@@ -181,6 +182,7 @@ public final class DecisionModelAction {
                 resourceMetrics.getCounter("retryWaitSec").inc(totalWaitSec);
             }
         }
+        terminal.setRequestContext(request.getRequestContext());
         ctx.sendEvent(terminal);
     }
 

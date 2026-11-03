@@ -31,7 +31,7 @@ import java.util.Map;
 import java.util.UUID;
 
 /** Event representing retrieved context results. */
-public class ContextRetrievalResponseEvent extends Event {
+public class ContextRetrievalResponseEvent extends RequestResponseEvent {
 
     public static final String EVENT_TYPE = "_context_retrieval_response_event";
 
@@ -39,6 +39,7 @@ public class ContextRetrievalResponseEvent extends Event {
 
     private static final List<BuiltInAttribute> ATTRIBUTE_SCHEMA =
             List.of(
+                    BuiltInAttribute.optional(REQUEST_CONTEXT, Map.class),
                     BuiltInAttribute.requiredUuid("request_id"),
                     BuiltInAttribute.required("query", String.class),
                     BuiltInAttribute.requiredList(
@@ -88,8 +89,8 @@ public class ContextRetrievalResponseEvent extends Event {
      * types.
      *
      * <p>Enforces the fixed cross-language schema: {@code request_id}, {@code query}, and {@code
-     * documents} are required and no other attribute is allowed; {@code query} must be a string and
-     * every {@code documents} element must be a {@link Document} or its serialized map.
+     * documents} are required, and {@code request_context} is optional. The {@code query} must be a
+     * string and every {@code documents} element must be a {@link Document} or its serialized map.
      *
      * @param event the base event containing context retrieval response data in attributes
      * @return a typed ContextRetrievalResponseEvent

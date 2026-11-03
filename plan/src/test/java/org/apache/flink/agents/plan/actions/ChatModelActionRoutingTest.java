@@ -975,8 +975,11 @@ public class ChatModelActionRoutingTest {
                         .register(
                                 "small", new FakeChatModel(ChatFixtures.response("ok from small")));
 
-        ChatModelAction.processChatRequestOrToolResponse(
-                new ChatRequestEvent("router", List.of(ChatMessage.user("write sql"))), ctx);
+        ChatRequestEvent request =
+                new ChatRequestEvent("router", List.of(ChatMessage.user("write sql")));
+        request.setRequestContext(Map.of("task", "route"));
+        ChatModelAction.processChatRequestOrToolResponse(request, ctx);
+        assertThat(ctx.chatResponse().getRequestContext()).isEqualTo(request.getRequestContext());
 
         // routed to big; big failed; fell back to small in declaration order
         assertThat(ctx.resolvedChatModels).containsExactly("big", "small");
@@ -1028,8 +1031,11 @@ public class ChatModelActionRoutingTest {
                                 "small", new FakeChatModel(new RuntimeException("small-exploded")));
 
         // The terminal error describes the last candidate; earlier failures stay in diagnostics.
-        ChatModelAction.processChatRequestOrToolResponse(
-                new ChatRequestEvent("router", List.of(ChatMessage.user("write sql"))), ctx);
+        ChatRequestEvent request =
+                new ChatRequestEvent("router", List.of(ChatMessage.user("write sql")));
+        request.setRequestContext(Map.of("task", "route"));
+        ChatModelAction.processChatRequestOrToolResponse(request, ctx);
+        assertThat(ctx.chatResponse().getRequestContext()).isEqualTo(request.getRequestContext());
         assertThat(ctx.chatResponse().isFailed()).isTrue();
         assertThat(ctx.chatResponse().getError()).contains("small-exploded");
         assertThat(ctx.resolvedChatModels).containsExactly("big", "small");

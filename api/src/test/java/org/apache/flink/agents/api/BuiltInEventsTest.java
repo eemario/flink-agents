@@ -617,6 +617,16 @@ class BuiltInEventsTest {
      */
     private static Stream<Arguments> mistypedAttributeCases() {
         return Stream.of(
+                Arguments.of(ChatRequestEvent.EVENT_TYPE, "request_context", "not-a-map"),
+                Arguments.of(ChatResponseEvent.EVENT_TYPE, "request_context", "not-a-map"),
+                Arguments.of(ToolRequestEvent.EVENT_TYPE, "request_context", "not-a-map"),
+                Arguments.of(ToolResponseEvent.EVENT_TYPE, "request_context", "not-a-map"),
+                Arguments.of(
+                        ContextRetrievalRequestEvent.EVENT_TYPE, "request_context", "not-a-map"),
+                Arguments.of(
+                        ContextRetrievalResponseEvent.EVENT_TYPE, "request_context", "not-a-map"),
+                Arguments.of(DecisionRequestEvent.EVENT_TYPE, "request_context", "not-a-map"),
+                Arguments.of(DecisionResponseEvent.EVENT_TYPE, "request_context", "not-a-map"),
                 // ChatRequestEvent
                 Arguments.of(ChatRequestEvent.EVENT_TYPE, "model", 0),
                 Arguments.of(ChatRequestEvent.EVENT_TYPE, "messages", List.of(0)),

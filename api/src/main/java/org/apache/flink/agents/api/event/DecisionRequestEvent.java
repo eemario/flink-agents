@@ -35,12 +35,13 @@ import java.util.Objects;
 import java.util.UUID;
 
 /** Requests a decision from a registered DecisionModel setup resource. */
-public class DecisionRequestEvent extends Event {
+public class DecisionRequestEvent extends RequestResponseEvent {
     public static final String EVENT_TYPE = "_decision_request_event";
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
     private static final List<BuiltInAttribute> ATTRIBUTE_SCHEMA =
             List.of(
+                    BuiltInAttribute.optional(REQUEST_CONTEXT, Map.class),
                     BuiltInAttribute.required("model", String.class),
                     BuiltInAttribute.requiredUntyped("request"),
                     BuiltInAttribute.optionalUntyped("request_params"));

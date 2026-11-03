@@ -94,6 +94,7 @@ import static org.apache.flink.agents.api.agents.Agent.STRUCTURED_OUTPUT;
 public class ChatModelAction {
     private static final Logger LOG = LoggerFactory.getLogger(ChatModelAction.class);
 
+    private static final String USER_REQUEST_CONTEXT = "_USER_REQUEST_CONTEXT";
     private static final String TOOL_CALL_CONTEXT = "_TOOL_CALL_CONTEXT";
     private static final String TOOL_REQUEST_EVENT_CONTEXT = "_TOOL_REQUEST_EVENT_CONTEXT";
     private static final String INITIAL_REQUEST_ID = "initialRequestId";
@@ -437,6 +438,8 @@ public class ChatModelAction {
                                     result.response,
                                     totalRetryCount,
                                     totalRetryWaitSec);
+                    completed.setRequestContext(
+                            takeUserRequestContext(ctx.getSensoryMemory(), initialRequestId));
                     completed.setStructuredOutput(result.structuredOutput);
                     if (routingMetadata != null) completed.setRoutingMetadata(routingMetadata);
                     ctx.sendEvent(completed);
@@ -480,12 +483,14 @@ public class ChatModelAction {
         LOG.warn("Chat request {} failed", requestId, error);
         Map<String, Long> stats = getRetryStats(ctx.getSensoryMemory(), requestId);
         clearRequestContext(ctx.getSensoryMemory(), requestId);
-        ctx.sendEvent(
+        ChatResponseEvent response =
                 ChatResponseEvent.failed(
                         requestId,
                         ChatModelInvoker.errorText(error),
                         stats.get(TOTAL_RETRY_COUNT).intValue(),
-                        stats.get(TOTAL_RETRY_WAIT_SEC).intValue()));
+                        stats.get(TOTAL_RETRY_WAIT_SEC).intValue());
+        response.setRequestContext(takeUserRequestContext(ctx.getSensoryMemory(), requestId));
+        ctx.sendEvent(response);
     }
 
     @SuppressWarnings("unchecked")
@@ -606,8 +611,39 @@ public class ChatModelAction {
         }
     }
 
+    @SuppressWarnings("unchecked")
+    private static void saveUserRequestContext(MemoryObject memory, ChatRequestEvent event)
+            throws Exception {
+        Map<String, Object> userContext = event.getRequestContext();
+        if (userContext == null) {
+            return;
+        }
+        Map<String, Object> contexts =
+                memory.isExist(USER_REQUEST_CONTEXT)
+                        ? new HashMap<>(
+                                (Map<String, Object>) memory.get(USER_REQUEST_CONTEXT).getValue())
+                        : new HashMap<>();
+        contexts.put(event.getId().toString(), userContext);
+        memory.set(USER_REQUEST_CONTEXT, contexts);
+    }
+
+    @Nullable
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> takeUserRequestContext(MemoryObject memory, UUID requestId)
+            throws Exception {
+        if (!memory.isExist(USER_REQUEST_CONTEXT)) {
+            return null;
+        }
+        Map<String, Object> contexts =
+                new HashMap<>((Map<String, Object>) memory.get(USER_REQUEST_CONTEXT).getValue());
+        Map<String, Object> context = (Map<String, Object>) contexts.remove(requestId.toString());
+        memory.set(USER_REQUEST_CONTEXT, contexts);
+        return context;
+    }
+
     private static void processChatRequest(ChatRequestEvent event, RunnerContext ctx)
             throws Exception {
+        saveUserRequestContext(ctx.getSensoryMemory(), event);
         ResolvedModelRoute selection;
         try {
             selection =

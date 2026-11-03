@@ -284,6 +284,20 @@ def _build_chat_response_event() -> ChatResponseEvent:
     return _force_id(event, _FIXED_EVENT_ID)
 
 
+def test_request_context_crosses_both_language_directions() -> None:
+    context = {"task": "摘要", "nested": [1, True, None, "42"]}
+    for name, event in [
+        ("context_chat_request_event.json", _build_chat_request_event()),
+        ("context_chat_response_event.json", _build_chat_response_event()),
+    ]:
+        event.set_request_context(context)
+        if _regenerate_enabled():
+            _write_python_snapshot(name, event)
+        _assert_python_snapshot_stable(name, event)
+        restored = _read_java_snapshot(name)
+        assert restored.request_context == context
+
+
 def test_regenerate_chat_response_event_python_snapshot() -> None:
     if not _regenerate_enabled():
         pytest.skip("Set REGENERATE_SNAPSHOTS=1 to refresh.")

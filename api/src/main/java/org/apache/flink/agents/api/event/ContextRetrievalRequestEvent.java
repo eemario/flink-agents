@@ -28,7 +28,7 @@ import java.util.Map;
 import java.util.UUID;
 
 /** Event representing a request for context retrieval. */
-public class ContextRetrievalRequestEvent extends Event {
+public class ContextRetrievalRequestEvent extends RequestResponseEvent {
 
     public static final String EVENT_TYPE = "_context_retrieval_request_event";
 
@@ -36,6 +36,7 @@ public class ContextRetrievalRequestEvent extends Event {
 
     private static final List<BuiltInAttribute> ATTRIBUTE_SCHEMA =
             List.of(
+                    BuiltInAttribute.optional(REQUEST_CONTEXT, Map.class),
                     BuiltInAttribute.required("query", String.class),
                     BuiltInAttribute.required("vector_store", String.class),
                     BuiltInAttribute.optional("max_results", Number.class));
@@ -93,8 +94,8 @@ public class ContextRetrievalRequestEvent extends Event {
      * Reconstructs a typed ContextRetrievalRequestEvent from a base Event.
      *
      * <p>Enforces the fixed cross-language schema: {@code query} and {@code vector_store} are
-     * required strings, {@code max_results} is an optional positive number, and no other attribute
-     * is allowed.
+     * required strings, {@code max_results} is an optional positive number, and {@code
+     * request_context} is an optional JSON object.
      *
      * @param event the base event containing context retrieval request data in attributes
      * @return a typed ContextRetrievalRequestEvent

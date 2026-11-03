@@ -27,9 +27,10 @@ from flink_agents.api.agents.types import OutputSchema
 from flink_agents.api.chat_message import ChatMessage
 from flink_agents.api.chat_result import ChatResult
 from flink_agents.api.events.event import BuiltInAttribute, Event
+from flink_agents.api.events.request_response_event import RequestResponseEvent
 
 
-class ChatRequestEvent(Event):
+class ChatRequestEvent(RequestResponseEvent):
     """Event representing a request to chat model.
 
     Attributes:
@@ -48,6 +49,7 @@ class ChatRequestEvent(Event):
     EVENT_TYPE: ClassVar[str] = "_chat_request_event"
 
     _ATTRIBUTE_SCHEMA: ClassVar[Tuple[BuiltInAttribute, ...]] = (
+        BuiltInAttribute.optional("request_context", dict),
         BuiltInAttribute.required("model", str),
         BuiltInAttribute.required_list(
             "messages", "a ChatMessage or its serialized dict", (ChatMessage, dict)
@@ -62,9 +64,12 @@ class ChatRequestEvent(Event):
         messages: List[ChatMessage],
         prompt_args: Dict[str, Any] | None = None,
         output_schema: OutputSchema | None = None,
+        *,
+        request_context: dict[str, Any] | None = None,
     ) -> None:
         """Create a ChatRequestEvent."""
         super().__init__(
+            request_context=request_context,
             type=ChatRequestEvent.EVENT_TYPE,
             attributes={
                 "model": model,
@@ -127,7 +132,7 @@ class ChatResponseError(RuntimeError):
         self.request_id = request_id
 
 
-class ChatResponseEvent(Event):
+class ChatResponseEvent(RequestResponseEvent):
     """Event representing a response from chat model.
 
     Attributes:
@@ -156,6 +161,7 @@ class ChatResponseEvent(Event):
     _MODEL_ROUTING: ClassVar[str] = "model_routing"
 
     _ATTRIBUTE_SCHEMA: ClassVar[Tuple[BuiltInAttribute, ...]] = (
+        BuiltInAttribute.optional("request_context", dict),
         BuiltInAttribute.required_untyped(_REQUEST_ID),
         BuiltInAttribute.required_untyped(_STATUS),
         BuiltInAttribute.optional_untyped(_RESPONSE),
@@ -174,6 +180,8 @@ class ChatResponseEvent(Event):
         error: str | None = None,
         retry_count: int = 0,
         total_retry_wait_sec: int = 0,
+        *,
+        request_context: dict[str, Any] | None = None,
     ) -> None:
         """Create a ChatResponseEvent."""
         if not (
@@ -196,6 +204,7 @@ class ChatResponseEvent(Event):
             msg = "request_id must be a UUID"
             raise TypeError(msg)
         super().__init__(
+            request_context=request_context,
             type=ChatResponseEvent.EVENT_TYPE,
             attributes={
                 self._REQUEST_ID: request_id,
@@ -214,11 +223,14 @@ class ChatResponseEvent(Event):
         response: ChatResult,
         retry_count: int = 0,
         total_retry_wait_sec: int = 0,
+        *,
+        request_context: dict[str, Any] | None = None,
     ) -> "ChatResponseEvent":
         """Create a successful terminal response."""
         return cls(
             request_id,
             cls.SUCCESS,
+            request_context=request_context,
             response=response,
             retry_count=retry_count,
             total_retry_wait_sec=total_retry_wait_sec,
@@ -231,11 +243,14 @@ class ChatResponseEvent(Event):
         error: str,
         retry_count: int = 0,
         total_retry_wait_sec: int = 0,
+        *,
+        request_context: dict[str, Any] | None = None,
     ) -> "ChatResponseEvent":
         """Create a failed terminal response."""
         return cls(
             request_id,
             cls.FAILED,
+            request_context=request_context,
             error=error,
             retry_count=retry_count,
             total_retry_wait_sec=total_retry_wait_sec,

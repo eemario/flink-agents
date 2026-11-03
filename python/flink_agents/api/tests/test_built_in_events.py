@@ -542,6 +542,14 @@ def _mistyped_attribute_cases() -> list[tuple[str, str, object]]:
     this table in lockstep with the schemas.
     """
     return [
+        (ChatRequestEvent.EVENT_TYPE, "request_context", "not-a-dict"),
+        (ChatResponseEvent.EVENT_TYPE, "request_context", "not-a-dict"),
+        (ToolRequestEvent.EVENT_TYPE, "request_context", "not-a-dict"),
+        (ToolResponseEvent.EVENT_TYPE, "request_context", "not-a-dict"),
+        (ContextRetrievalRequestEvent.EVENT_TYPE, "request_context", "not-a-dict"),
+        (ContextRetrievalResponseEvent.EVENT_TYPE, "request_context", "not-a-dict"),
+        (DecisionRequestEvent.EVENT_TYPE, "request_context", "not-a-dict"),
+        (DecisionResponseEvent.EVENT_TYPE, "request_context", "not-a-dict"),
         # ChatRequestEvent
         (ChatRequestEvent.EVENT_TYPE, "model", 0),
         (ChatRequestEvent.EVENT_TYPE, "messages", [0]),

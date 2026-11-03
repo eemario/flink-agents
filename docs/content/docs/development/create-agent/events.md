@@ -34,6 +34,56 @@ Events carry data between Actions. Each Event has:
 One Event can trigger multiple Actions. For matching by type or payload, see
 [Trigger Conditions]({{< ref "docs/development/create-agent/actions#trigger-conditions" >}}).
 
+## Request Context
+
+Chat, tool, context-retrieval, and decision request/response events support optional
+`request_context`. Use it to identify the business purpose of a response when an
+Action sends several requests:
+
+{{< tabs "Request Context" >}}
+{{< tab "Python" >}}
+```python
+request = ChatRequestEvent(
+    model="review-model",
+    messages=[ChatMessage.user("Summarize this review.")],
+    request_context={"task": "summary", "item_id": "42"},
+)
+ctx.send_event(request)
+
+# In the Action handling ChatResponseEvent:
+task = event.request_context["task"]
+```
+{{< /tab >}}
+{{< tab "Java" >}}
+```java
+ChatRequestEvent request = new ChatRequestEvent(
+        "review-model", List.of(ChatMessage.user("Summarize this review.")));
+request.setRequestContext(Map.of("task", "summary", "item_id", "42"));
+ctx.sendEvent(request);
+
+// In the Action handling ChatResponseEvent:
+String task = (String) ((ChatResponseEvent) event).getRequestContext().get("task");
+```
+{{< /tab >}}
+{{< /tabs >}}
+
+Context is a JSON object: string keys and nested objects, lists, strings, booleans,
+finite numbers, or null values. Setting and reading context copies nested values.
+Omitted context is returned as `None` / `null`; an empty object remains empty.
+Use `set_request_context(...)` / `setRequestContext(...)` to replace context, or
+pass `None` / `null` to remove it.
+
+Each response returns its own request's context, including failed responses where
+the event protocol supports them. Chat preserves the initial request's context
+through retries, model fallback, and tool-call rounds. Internally generated tool
+requests do not inherit the enclosing chat context; a ToolRequest's context belongs
+to that tool request and its corresponding ToolResponse.
+
+Context is stored inline in event attributes and is preserved by serialization
+and recovery. It is not added to prompts, tool arguments, or ordinary attachments.
+Attachments are independent and are not automatically copied to responses.
+This adds no new failure responses for errors that already propagate to the runtime.
+
 ## Input and Output Events {#special-events}
 
 `InputEvent` and `OutputEvent` connect an Agent to the surrounding Flink pipeline:

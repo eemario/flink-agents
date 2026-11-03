@@ -101,7 +101,10 @@ public class ToolCallAction {
             executeSequentially(executions, toolCallAsync, ctx, success, error, responses);
         }
 
-        ctx.sendEvent(new ToolResponseEvent(toolRequest.getId(), responses, success, error));
+        ToolResponseEvent response =
+                new ToolResponseEvent(toolRequest.getId(), responses, success, error);
+        response.setRequestContext(toolRequest.getRequestContext());
+        ctx.sendEvent(response);
     }
 
     @SuppressWarnings("unchecked")

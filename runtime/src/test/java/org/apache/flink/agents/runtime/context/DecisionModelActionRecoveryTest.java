@@ -36,6 +36,7 @@ import org.apache.flink.agents.runtime.async.ContinuationContext;
 import org.apache.flink.agents.runtime.metrics.FlinkAgentsMetricGroupImpl;
 import org.apache.flink.runtime.metrics.groups.UnregisteredMetricGroups;
 import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
@@ -84,6 +85,11 @@ class DecisionModelActionRecoveryTest {
         if (executor != null) {
             executor.close();
         }
+    }
+
+    @BeforeEach
+    void setRequestContext() {
+        request.setRequestContext(Map.of("task", "decision", "nested", Map.of("id", "42")));
     }
 
     @ParameterizedTest
@@ -275,6 +281,7 @@ class DecisionModelActionRecoveryTest {
         DecisionResponseEvent response =
                 DecisionResponseEvent.fromEvent(context.getPendingEvents().get(0));
         assertThat(response.getRequestId()).isEqualTo(request.getId());
+        assertThat(response.getRequestContext()).isEqualTo(request.getRequestContext());
         assertThat(response.getRetryCount()).isEqualTo(retryCount);
         assertThat(response.getTotalRetryWaitSec()).isZero();
         assertThat(response.isFailed()).isEqualTo(failed);

@@ -1,0 +1,31 @@
+{
+  "id": "00000000-0000-0000-0000-000000000001",
+  "type": "_chat_request_event",
+  "attributes": {
+    "model": "test-model",
+    "messages": [
+      {
+        "role": "user",
+        "blocks": [
+          {
+            "type": "text",
+            "text": "hello world"
+          }
+        ],
+        "metadata": {}
+      }
+    ],
+    "prompt_args": {},
+    "output_schema": null,
+    "request_context": {
+      "task": "摘要",
+      "nested": [
+        1,
+        true,
+        null,
+        "42"
+      ]
+    }
+  },
+  "attachments": {}
+}

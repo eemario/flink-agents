@@ -1,0 +1,38 @@
+{
+  "id": "00000000-0000-0000-0000-000000000001",
+  "type": "_chat_response_event",
+  "attributes": {
+    "request_id": "00000000-0000-0000-0000-000000000002",
+    "status": "SUCCESS",
+    "response": {
+      "model": null,
+      "response_id": null,
+      "usage": null,
+      "finish_reason": null,
+      "metadata": {},
+      "message": {
+        "role": "assistant",
+        "blocks": [
+          {
+            "type": "text",
+            "text": "hi there"
+          }
+        ],
+        "metadata": {}
+      }
+    },
+    "error": null,
+    "retry_count": 0,
+    "total_retry_wait_sec": 0,
+    "request_context": {
+      "task": "摘要",
+      "nested": [
+        1,
+        true,
+        null,
+        "42"
+      ]
+    }
+  },
+  "attachments": {}
+}

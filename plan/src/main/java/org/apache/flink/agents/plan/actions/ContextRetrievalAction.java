@@ -95,11 +95,13 @@ public class ContextRetrievalAction {
                             ? ctx.durableExecuteAsync(callable).await()
                             : ctx.durableExecute(callable);
 
-            ctx.sendEvent(
+            ContextRetrievalResponseEvent response =
                     new ContextRetrievalResponseEvent(
                             contextRetrievalRequestEvent.getId(),
                             contextRetrievalRequestEvent.getQuery(),
-                            result.getDocuments()));
+                            result.getDocuments());
+            response.setRequestContext(contextRetrievalRequestEvent.getRequestContext());
+            ctx.sendEvent(response);
         }
     }
 }

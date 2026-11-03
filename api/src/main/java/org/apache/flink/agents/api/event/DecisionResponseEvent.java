@@ -31,7 +31,7 @@ import java.util.Objects;
 import java.util.UUID;
 
 /** A terminal decision result or request failure, correlated with its request event. */
-public class DecisionResponseEvent extends Event {
+public class DecisionResponseEvent extends RequestResponseEvent {
 
     public static final String EVENT_TYPE = "_decision_response_event";
     public static final String SUCCESS = "SUCCESS";
@@ -46,6 +46,7 @@ public class DecisionResponseEvent extends Event {
 
     private static final List<BuiltInAttribute> ATTRIBUTE_SCHEMA =
             List.of(
+                    BuiltInAttribute.optional(REQUEST_CONTEXT, Map.class),
                     BuiltInAttribute.requiredUntyped(REQUEST_ID),
                     BuiltInAttribute.requiredUntyped(STATUS),
                     BuiltInAttribute.optionalUntyped(RESPONSE),

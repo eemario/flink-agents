@@ -41,6 +41,7 @@ import org.apache.flink.agents.api.event.ContextRetrievalResponseEvent;
 import org.apache.flink.agents.api.event.DecisionRequestEvent;
 import org.apache.flink.agents.api.event.DecisionResponseEvent;
 import org.apache.flink.agents.api.event.MemoryEvent;
+import org.apache.flink.agents.api.event.RequestResponseEvent;
 import org.apache.flink.agents.api.event.ShortTermWriteEvent;
 import org.apache.flink.agents.api.event.ToolRequestEvent;
 import org.apache.flink.agents.api.event.ToolResponseEvent;
@@ -249,6 +250,25 @@ class CrossLanguageEventSnapshotTest {
         attrs.put("model", "test-model");
         attrs.put("messages", List.of(new ChatMessage(MessageRole.USER, "hello world")));
         return new ChatRequestEvent(FIXED_EVENT_ID, attrs);
+    }
+
+    @Test
+    void requestContextCrossesBothLanguageDirections() throws Exception {
+        Map<String, Object> context =
+                Map.of("task", "摘要", "nested", java.util.Arrays.asList(1, true, null, "42"));
+        for (String name : List.of("chat_request_event.json", "chat_response_event.json")) {
+            RequestResponseEvent event =
+                    (RequestResponseEvent)
+                            (name.startsWith("chat_request")
+                                    ? buildChatRequestEvent()
+                                    : buildChatResponseEvent());
+            event.setRequestContext(context);
+            String snapshot = "context_" + name;
+            if (regenerateRequested()) writeJavaSnapshot(snapshot, event);
+            assertJavaSnapshotStable(snapshot, event);
+            RequestResponseEvent restored = (RequestResponseEvent) readPythonSnapshot(snapshot);
+            assertEquals(context, restored.getRequestContext());
+        }
     }
 
     @Test

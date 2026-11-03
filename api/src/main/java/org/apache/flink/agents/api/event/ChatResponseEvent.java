@@ -30,7 +30,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.UUID;
 
-public class ChatResponseEvent extends Event {
+public class ChatResponseEvent extends RequestResponseEvent {
 
     public static final String EVENT_TYPE = "_chat_response_event";
     public static final String SUCCESS = "SUCCESS";
@@ -47,6 +47,7 @@ public class ChatResponseEvent extends Event {
 
     private static final List<BuiltInAttribute> ATTRIBUTE_SCHEMA =
             List.of(
+                    BuiltInAttribute.optional(REQUEST_CONTEXT, Map.class),
                     BuiltInAttribute.requiredUntyped(REQUEST_ID),
                     BuiltInAttribute.requiredUntyped(STATUS),
                     BuiltInAttribute.optionalUntyped(RESPONSE),

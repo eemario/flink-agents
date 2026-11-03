@@ -58,7 +58,8 @@ def test_decision_action_replays_success_or_failure_across_processes(
     )
     request_params = {"timeout": 4.0, "extra_headers": {"X-Trace-ID": "review-1"}}
     event = DecisionRequestEvent(
-        "review-decision", request, request_params=request_params
+        "review-decision", request, request_params=request_params,
+        request_context={"task": "decision", "nested": {"item_id": "42"}},
     )
     result = DecisionResult(
         answers={"urgent": PredicateAnswer(probability_true=0.8)},
@@ -113,6 +114,7 @@ def test_decision_action_replays_success_or_failure_across_processes(
     assert stored.exception_payload is None
     outcome = cloudpickle.loads(stored.result_payload)
     assert responses[0].request_id == responses[1].request_id == event.id
+    assert responses[0].request_context == responses[1].request_context == event.request_context
     if provider_fails:
         assert outcome == (None, "ValueError: provider unavailable")
         assert responses[0].is_failed

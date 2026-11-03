@@ -408,7 +408,8 @@ public class ToolCallActionTest {
         assertThat(response.getError())
                 .containsEntry(
                         "call-1",
-                        "Memory path for injected tool parameter must reference a value: request.tenant_id");
+                        "Memory path for injected tool parameter must reference a value:"
+                                + " request.tenant_id");
     }
 
     @Test
@@ -425,7 +426,8 @@ public class ToolCallActionTest {
         assertThat(response.getError())
                 .containsEntry(
                         "call-1",
-                        "Cannot inject tool parameter from sensory_memory because memory is not initialized.");
+                        "Cannot inject tool parameter from sensory_memory because memory is not"
+                                + " initialized.");
     }
 
     @Test
@@ -457,9 +459,14 @@ public class ToolCallActionTest {
                     }
                 };
 
-        ToolCallAction.processToolRequest(toolRequest("queryOrder"), ctx);
+        ToolRequestEvent request = toolRequest("queryOrder");
+        request.setRequestContext(Map.of("task", "tool"));
+        request.setAttachment("unrelated", "payload");
+        ToolCallAction.processToolRequest(request, ctx);
 
         ToolResponseEvent response = ToolResponseEvent.fromEvent(ctx.sentEvents.get(0));
+        assertThat(response.getRequestContext()).isEqualTo(request.getRequestContext());
+        assertThat(response.getAttachments()).isEmpty();
         assertThat(response.getSuccess()).containsEntry("call-1", false);
         assertThat(response.getResponses().get("call-1").getError())
                 .isEqualTo("Tool queryOrder does not exist.");

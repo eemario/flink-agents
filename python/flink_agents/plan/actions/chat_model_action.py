@@ -56,6 +56,7 @@ if TYPE_CHECKING:
     from flink_agents.api.chat_models.chat_model import BaseChatModelSetup
     from flink_agents.api.metric_group import MetricGroup
 
+_USER_REQUEST_CONTEXT = "_USER_REQUEST_CONTEXT"
 _TOOL_CALL_CONTEXT = "_TOOL_CALL_CONTEXT"
 _TOOL_REQUEST_EVENT_CONTEXT = "_TOOL_REQUEST_EVENT_CONTEXT"
 _RETRY_STATS_CONTEXT = "_RETRY_STATS_CONTEXT"
@@ -200,6 +201,7 @@ def _send_failure(request_id: UUID, error: Exception, ctx: RunnerContext) -> Non
             _error_text(error),
             stats["total_retry_count"],
             stats["total_retry_wait_sec"],
+            request_context=_take_user_request_context(ctx.sensory_memory, request_id),
         )
     )
 
@@ -764,6 +766,9 @@ async def chat(
         _clear_request_context(ctx.sensory_memory, initial_request_id)
         completed = ChatResponseEvent.success(
             request_id=initial_request_id,
+            request_context=_take_user_request_context(
+                ctx.sensory_memory, initial_request_id
+            ),
             response=response,
             retry_count=total_retry_count,
             total_retry_wait_sec=total_retry_wait_sec,
@@ -772,8 +777,22 @@ async def chat(
         ctx.send_event(completed)
 
 
+def _take_user_request_context(
+    memory: MemoryObject, request_id: UUID
+) -> dict[str, Any] | None:
+    contexts = dict(memory.get(_USER_REQUEST_CONTEXT) or {})
+    context = contexts.pop(str(request_id), None)
+    if context is not None:
+        memory.set(_USER_REQUEST_CONTEXT, contexts)
+    return context
+
+
 async def _process_chat_request(event: ChatRequestEvent, ctx: RunnerContext) -> None:
     """Process chat request event."""
+    if event.request_context is not None:
+        contexts = dict(ctx.sensory_memory.get(_USER_REQUEST_CONTEXT) or {})
+        contexts[str(event.id)] = event.request_context
+        ctx.sensory_memory.set(_USER_REQUEST_CONTEXT, contexts)
     await chat(
         initial_request_id=event.id,
         model=event.model,

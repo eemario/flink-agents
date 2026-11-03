@@ -34,7 +34,7 @@ import java.util.Map;
 import java.util.UUID;
 
 /** Event representing a request for chat. */
-public class ChatRequestEvent extends Event {
+public class ChatRequestEvent extends RequestResponseEvent {
 
     public static final String EVENT_TYPE = "_chat_request_event";
 
@@ -42,11 +42,12 @@ public class ChatRequestEvent extends Event {
 
     /**
      * The fixed cross-language attribute schema for this event: {@code model} and {@code messages}
-     * are required, {@code prompt_args} and {@code output_schema} are optional, and no other
-     * attribute is allowed. {@link #fromEvent} enforces it at the JSON boundary.
+     * are required; {@code prompt_args}, {@code output_schema}, and {@code request_context} are
+     * optional. {@link #fromEvent} enforces it at the JSON boundary.
      */
     private static final List<BuiltInAttribute> ATTRIBUTE_SCHEMA =
             List.of(
+                    BuiltInAttribute.optional(REQUEST_CONTEXT, Map.class),
                     BuiltInAttribute.required("model", String.class),
                     BuiltInAttribute.requiredList(
                             "messages",
@@ -108,10 +109,10 @@ public class ChatRequestEvent extends Event {
      * Reconstructs a typed ChatRequestEvent from a base Event, deserializing nested types.
      *
      * <p>Enforces the fixed cross-language attribute schema: {@code model} and {@code messages} are
-     * required, {@code prompt_args} and {@code output_schema} are optional, no other attribute is
-     * allowed, {@code model} must be a string, and every {@code messages} element must be a {@link
-     * ChatMessage} or its serialized map — an element such as a bare number is rejected rather than
-     * silently dropped.
+     * required; {@code prompt_args}, {@code output_schema}, and {@code request_context} are
+     * optional. The {@code model} must be a string, and every {@code messages} element must be a
+     * {@link ChatMessage} or its serialized map — an element such as a bare number is rejected
+     * rather than silently dropped.
      *
      * @param event the base event containing chat request data in attributes
      * @return a typed ChatRequestEvent

@@ -158,13 +158,15 @@ async def process_decision_request(
     if failure is not None:
         ctx.send_event(
             DecisionResponseEvent.failed(
-                event.id, failure, retry_count, total_retry_wait_sec
+                event.id, failure, retry_count, total_retry_wait_sec,
+                request_context=event.request_context,
             )
         )
     else:
         ctx.send_event(
             DecisionResponseEvent.success(
-                event.id, response, retry_count, total_retry_wait_sec
+                event.id, response, retry_count, total_retry_wait_sec,
+                request_context=event.request_context,
             )
         )
 

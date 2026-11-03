@@ -17,6 +17,7 @@
  */
 package org.apache.flink.agents.plan.actions;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import org.apache.flink.agents.api.Event;
 import org.apache.flink.agents.api.agents.Agent;
 import org.apache.flink.agents.api.agents.AgentExecutionOptions;
@@ -31,6 +32,7 @@ import org.apache.flink.agents.api.chat.model.BaseChatModelSetup;
 import org.apache.flink.agents.api.context.DurableCallable;
 import org.apache.flink.agents.api.context.MemoryObject;
 import org.apache.flink.agents.api.context.RunnerContext;
+import org.apache.flink.agents.api.event.ChatRequestEvent;
 import org.apache.flink.agents.api.event.ChatResponseEvent;
 import org.apache.flink.agents.api.event.ToolRequestEvent;
 import org.apache.flink.agents.api.event.ToolResponseEvent;
@@ -138,6 +140,66 @@ class ChatModelActionRetryTest {
         if (mocks != null) {
             mocks.close();
         }
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void interleavedRequestsPreserveContextThroughToolRoundsAndRestore(boolean failed)
+            throws Exception {
+        configureRetryStrategy(0, 0);
+        ChatResult toolResult =
+                new ChatResult(
+                        ChatMessage.assistant(
+                                List.of(new ToolCallBlock("call", "tool", Map.of()))));
+        AtomicInteger calls = new AtomicInteger();
+        when(mockChatModel.chat(any(), any(), any()))
+                .thenAnswer(
+                        inv -> {
+                            int index = calls.getAndIncrement();
+                            if (index < 3) return toolResult;
+                            if (index == 4 && failed) throw new RuntimeException("A failed");
+                            return ChatFixtures.response(index == 3 ? "B done" : "A done");
+                        });
+        ChatRequestEvent a = new ChatRequestEvent("model", List.of(ChatMessage.user("same")));
+        ChatRequestEvent b = new ChatRequestEvent("model", List.of(ChatMessage.user("same")));
+        a.setRequestContext(Map.of("task", "A", "nested", Map.of("items", List.of(1))));
+        b.setRequestContext(Map.of("task", "B", "nested", Map.of("items", List.of(2))));
+        a.setAttachment("unrelated", "payload");
+        ChatModelAction.processChatRequestOrToolResponse(a, mockCtx);
+        ChatModelAction.processChatRequestOrToolResponse(b, mockCtx);
+        ToolRequestEvent toolA = (ToolRequestEvent) sentEvents.get(0);
+        ToolRequestEvent toolB = (ToolRequestEvent) sentEvents.get(1);
+        assertThat(toolA.getRequestContext()).isNull();
+        assertThat(toolB.getRequestContext()).isNull();
+        ObjectMapper mapper = new ObjectMapper();
+        sensoryMemory.set(
+                "_USER_REQUEST_CONTEXT",
+                mapper.readValue(
+                        mapper.writeValueAsString(
+                                sensoryMemory.get("_USER_REQUEST_CONTEXT").getValue()),
+                        Map.class));
+        replyToTool(toolB, mapper);
+        replyToTool((ToolRequestEvent) sentEvents.get(2), mapper);
+        replyToTool(toolA, mapper);
+        ChatResponseEvent responseB = (ChatResponseEvent) sentEvents.get(3);
+        ChatResponseEvent responseA = (ChatResponseEvent) sentEvents.get(4);
+        assertThat(responseB.getRequestId()).isEqualTo(b.getId());
+        assertThat(responseB.getRequestContext()).isEqualTo(b.getRequestContext());
+        assertThat(responseA.getRequestId()).isEqualTo(a.getId());
+        assertThat(responseA.getRequestContext()).isEqualTo(a.getRequestContext());
+        assertThat(responseA.isFailed()).isEqualTo(failed);
+        assertThat(responseA.getAttachments()).isEmpty();
+        assertThat((Map<?, ?>) sensoryMemory.get("_USER_REQUEST_CONTEXT").getValue()).isEmpty();
+    }
+
+    private void replyToTool(ToolRequestEvent request, ObjectMapper mapper) throws Exception {
+        ToolResponseEvent reply =
+                new ToolResponseEvent(
+                        request.getId(), Map.of("call", ToolResponse.text("result")),
+                        Map.of("call", true), Map.of());
+        reply.setRequestContext(Map.of("task", "tool-only"));
+        ChatModelAction.processChatRequestOrToolResponse(
+                Event.fromJson(mapper.writeValueAsString(reply)), mockCtx);
     }
 
     @Test

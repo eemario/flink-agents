@@ -564,12 +564,17 @@ class DecisionModelActionTest {
         }
 
         private void run() throws Exception {
+            request.setRequestContext(Map.of("task", "decision"));
+            request.setAttachment("unrelated", "payload");
             DecisionModelAction.processDecisionRequest(request, ctx);
         }
 
         private DecisionResponseEvent response() {
             assertThat(events).hasSize(1);
-            return (DecisionResponseEvent) events.get(0);
+            DecisionResponseEvent response = (DecisionResponseEvent) events.get(0);
+            assertThat(response.getRequestContext()).isEqualTo(request.getRequestContext());
+            assertThat(response.getAttachments()).isEmpty();
+            return response;
         }
     }
 }

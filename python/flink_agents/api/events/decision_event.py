@@ -19,7 +19,7 @@
 
 import json
 from collections.abc import Mapping
-from typing import ClassVar, Tuple
+from typing import Any, ClassVar, Tuple
 from uuid import UUID
 
 from pydantic import JsonValue
@@ -28,9 +28,10 @@ from typing_extensions import override
 from flink_agents.api.decision_models import DecisionRequest, DecisionResult
 from flink_agents.api.decision_models.decision_model import _validate_request_params
 from flink_agents.api.events.event import BuiltInAttribute, Event
+from flink_agents.api.events.request_response_event import RequestResponseEvent
 
 
-class DecisionRequestEvent(Event):
+class DecisionRequestEvent(RequestResponseEvent):
     """Request a decision from a registered DecisionModel setup resource.
 
     ``model`` is the registered resource name, not a provider model identifier.
@@ -40,6 +41,7 @@ class DecisionRequestEvent(Event):
 
     EVENT_TYPE: ClassVar[str] = "_decision_request_event"
     _ATTRIBUTE_SCHEMA: ClassVar[Tuple[BuiltInAttribute, ...]] = (
+        BuiltInAttribute.optional("request_context", dict),
         BuiltInAttribute.required("model", str),
         BuiltInAttribute.required_untyped("request"),
         BuiltInAttribute.optional_untyped("request_params"),
@@ -51,12 +53,14 @@ class DecisionRequestEvent(Event):
         request: DecisionRequest,
         *,
         request_params: Mapping[str, JsonValue] | None = None,
+        request_context: dict[str, Any] | None = None,
     ) -> None:
         """Create a decision request event."""
         if not isinstance(model, str) or not isinstance(request, DecisionRequest):
             msg = "Decision request requires a model resource name and DecisionRequest."
             raise TypeError(msg)
         super().__init__(
+            request_context=request_context,
             type=self.EVENT_TYPE,
             attributes={
                 "model": model,
@@ -104,7 +108,7 @@ class DecisionResponseError(RuntimeError):
         self.request_id = request_id
 
 
-class DecisionResponseEvent(Event):
+class DecisionResponseEvent(RequestResponseEvent):
     """Event representing a response from decision model.
 
     Attributes:
@@ -131,6 +135,7 @@ class DecisionResponseEvent(Event):
     _TOTAL_RETRY_WAIT_SEC: ClassVar[str] = "total_retry_wait_sec"
 
     _ATTRIBUTE_SCHEMA: ClassVar[Tuple[BuiltInAttribute, ...]] = (
+        BuiltInAttribute.optional("request_context", dict),
         BuiltInAttribute.required_untyped(_REQUEST_ID),
         BuiltInAttribute.required_untyped(_STATUS),
         BuiltInAttribute.optional_untyped(_RESPONSE),
@@ -147,6 +152,8 @@ class DecisionResponseEvent(Event):
         error: str | None = None,
         retry_count: int = 0,
         total_retry_wait_sec: int = 0,
+        *,
+        request_context: dict[str, Any] | None = None,
     ) -> None:
         """Create a DecisionResponseEvent."""
         if not (
@@ -171,6 +178,7 @@ class DecisionResponseEvent(Event):
             msg = "request_id must be a UUID"
             raise TypeError(msg)
         super().__init__(
+            request_context=request_context,
             type=DecisionResponseEvent.EVENT_TYPE,
             attributes={
                 self._REQUEST_ID: request_id,
@@ -189,11 +197,14 @@ class DecisionResponseEvent(Event):
         response: DecisionResult,
         retry_count: int = 0,
         total_retry_wait_sec: int = 0,
+        *,
+        request_context: dict[str, Any] | None = None,
     ) -> "DecisionResponseEvent":
         """Create a successful terminal response."""
         return cls(
             request_id,
             cls.SUCCESS,
+            request_context=request_context,
             response=response,
             retry_count=retry_count,
             total_retry_wait_sec=total_retry_wait_sec,
@@ -206,11 +217,14 @@ class DecisionResponseEvent(Event):
         error: str,
         retry_count: int = 0,
         total_retry_wait_sec: int = 0,
+        *,
+        request_context: dict[str, Any] | None = None,
     ) -> "DecisionResponseEvent":
         """Create a failed terminal response."""
         return cls(
             request_id,
             cls.FAILED,
+            request_context=request_context,
             error=error,
             retry_count=retry_count,
             total_retry_wait_sec=total_retry_wait_sec,

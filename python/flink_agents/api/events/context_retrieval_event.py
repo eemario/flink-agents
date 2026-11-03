@@ -15,7 +15,7 @@
 #  See the License for the specific language governing permissions and
 # limitations under the License.
 #################################################################################
-from typing import ClassVar, List, Tuple
+from typing import Any, ClassVar, List, Tuple
 
 try:
     from typing import override
@@ -24,10 +24,11 @@ except ImportError:
 from uuid import UUID
 
 from flink_agents.api.events.event import BuiltInAttribute, Event
+from flink_agents.api.events.request_response_event import RequestResponseEvent
 from flink_agents.api.vector_stores.vector_store import Document
 
 
-class ContextRetrievalRequestEvent(Event):
+class ContextRetrievalRequestEvent(RequestResponseEvent):
     """Event representing a request for context retrieval.
 
     Attributes:
@@ -43,12 +44,20 @@ class ContextRetrievalRequestEvent(Event):
     EVENT_TYPE: ClassVar[str] = "_context_retrieval_request_event"
 
     _ATTRIBUTE_SCHEMA: ClassVar[Tuple[BuiltInAttribute, ...]] = (
+        BuiltInAttribute.optional("request_context", dict),
         BuiltInAttribute.required("query", str),
         BuiltInAttribute.required("vector_store", str),
         BuiltInAttribute.optional("max_results", int),
     )
 
-    def __init__(self, query: str, vector_store: str, max_results: int = 3) -> None:
+    def __init__(
+        self,
+        query: str,
+        vector_store: str,
+        max_results: int = 3,
+        *,
+        request_context: dict[str, Any] | None = None,
+    ) -> None:
         """Create a ContextRetrievalRequestEvent.
 
         Args:
@@ -56,6 +65,7 @@ class ContextRetrievalRequestEvent(Event):
         query: The search query text to find relevant context for.
         vector_store: Name of the vector store setup resource to use.
         max_results: Maximum number of results to return (default: 3). Must be positive.
+        request_context: Optional JSON context returned with the response.
 
         Raises:
         ------
@@ -65,6 +75,7 @@ class ContextRetrievalRequestEvent(Event):
             msg = f"`max_results` must be positive, but was {max_results}."
             raise ValueError(msg)
         super().__init__(
+            request_context=request_context,
             type=ContextRetrievalRequestEvent.EVENT_TYPE,
             attributes={
                 "query": query,
@@ -103,7 +114,7 @@ class ContextRetrievalRequestEvent(Event):
         return self.get_attr("max_results")
 
 
-class ContextRetrievalResponseEvent(Event):
+class ContextRetrievalResponseEvent(RequestResponseEvent):
     """Event representing retrieved context results.
 
     Attributes:
@@ -119,6 +130,7 @@ class ContextRetrievalResponseEvent(Event):
     EVENT_TYPE: ClassVar[str] = "_context_retrieval_response_event"
 
     _ATTRIBUTE_SCHEMA: ClassVar[Tuple[BuiltInAttribute, ...]] = (
+        BuiltInAttribute.optional("request_context", dict),
         BuiltInAttribute.required_uuid("request_id"),
         BuiltInAttribute.required("query", str),
         BuiltInAttribute.required_list(
@@ -126,9 +138,17 @@ class ContextRetrievalResponseEvent(Event):
         ),
     )
 
-    def __init__(self, request_id: UUID, query: str, documents: List[Document]) -> None:
+    def __init__(
+        self,
+        request_id: UUID,
+        query: str,
+        documents: List[Document],
+        *,
+        request_context: dict[str, Any] | None = None,
+    ) -> None:
         """Create a ContextRetrievalResponseEvent."""
         super().__init__(
+            request_context=request_context,
             type=ContextRetrievalResponseEvent.EVENT_TYPE,
             attributes={
                 "request_id": request_id,

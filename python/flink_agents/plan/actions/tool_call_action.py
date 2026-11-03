@@ -167,6 +167,7 @@ async def process_tool_request(event: Event, ctx: RunnerContext) -> None:
     ctx.send_event(
         ToolResponseEvent(
             request_id=event.id,
+            request_context=event.request_context,
             responses=responses,
             success=success,
             error=error,

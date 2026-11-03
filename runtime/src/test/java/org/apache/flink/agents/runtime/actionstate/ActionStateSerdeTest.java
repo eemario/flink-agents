@@ -65,6 +65,25 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 public class ActionStateSerdeTest {
 
     @Test
+    void requestContextAndParkedChatContextSurviveActionStateRecovery() throws Exception {
+        ChatRequestEvent request = new ChatRequestEvent("model", List.of(ChatMessage.user("hi")));
+        Map<String, Object> context = Map.of("task", "summary", "nested", List.of("42"));
+        request.setRequestContext(context);
+        ActionState state = new ActionState(request);
+        Map<String, Object> parked = Map.of(request.getId().toString(), context);
+        state.addSensoryMemoryUpdate(new MemoryUpdate("_USER_REQUEST_CONTEXT", parked));
+        ChatResponseEvent response = ChatResponseEvent.failed(request.getId(), "failed", 1, 0);
+        response.setRequestContext(context);
+        state.addEvent(response);
+        ActionState restored = ActionStateSerde.deserialize(ActionStateSerde.serialize(state));
+        assertEquals(context, ((ChatRequestEvent) restored.getTaskEvent()).getRequestContext());
+        assertEquals(parked, restored.getSensoryMemoryUpdates().get(0).getValue());
+        assertEquals(
+                context,
+                ((ChatResponseEvent) restored.getOutputEvents().get(0)).getRequestContext());
+    }
+
+    @Test
     public void testActionStateSerializationDeserialization() throws Exception {
         // Create test data
         InputEvent inputEvent = new InputEvent("test input");

@@ -31,12 +31,13 @@ import java.util.Map;
 import java.util.UUID;
 
 /** Event representing a result from tool call */
-public class ToolResponseEvent extends Event {
+public class ToolResponseEvent extends RequestResponseEvent {
 
     public static final String EVENT_TYPE = "_tool_response_event";
 
     private static final List<BuiltInAttribute> ATTRIBUTE_SCHEMA =
             List.of(
+                    BuiltInAttribute.optional(REQUEST_CONTEXT, Map.class),
                     BuiltInAttribute.requiredUuid("request_id"),
                     BuiltInAttribute.required("responses", Map.class),
                     BuiltInAttribute.optional("success", Map.class),
