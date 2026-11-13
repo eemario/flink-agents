@@ -17,6 +17,8 @@
 #################################################################################
 import json
 import tempfile
+from datetime import timedelta
+from enum import Enum
 from pathlib import Path
 
 import pytest
@@ -482,3 +484,27 @@ def test_trace_log_target_error_identifies_list_entry() -> None:
             AgentConfigOptions.TRACE_LOG_TARGETS,
             [TraceLogTarget.all(), {"scope": {"unknown": "search"}}],
         )
+
+
+@pytest.mark.parametrize(
+    "duration", [timedelta(0), timedelta(microseconds=1500), timedelta(microseconds=-1)]
+)
+def test_generic_duration_config_preserves_precision(duration):
+    option = ConfigOption("custom.duration", timedelta)
+    config = AgentConfiguration()
+    config.set(option, duration)
+    restored = AgentConfiguration.model_validate_json(config.model_dump_json())
+    assert restored.get(option) == duration
+
+
+class _TestMode(Enum):
+    ENABLED = "enabled"
+
+
+@pytest.mark.parametrize("value", [_TestMode.ENABLED, "ENABLED", "enabled"])
+def test_generic_enum_configuration(value):
+    option = ConfigOption("custom.mode", _TestMode)
+    config = AgentConfiguration()
+    config.set(option, value)
+    restored = AgentConfiguration.model_validate_json(config.model_dump_json())
+    assert restored.get(option) is _TestMode.ENABLED

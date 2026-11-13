@@ -15,6 +15,8 @@
 #  See the License for the specific language governing permissions and
 # limitations under the License.
 #################################################################################
+from datetime import timedelta
+from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, Type
 
@@ -25,6 +27,7 @@ from typing_extensions import override
 from flink_agents.api.configuration import (
     ConfigOption,
     Configuration,
+    parse_duration,
 )
 from flink_agents.api.trace_log import _parse_targets, _serialize_targets
 
@@ -101,6 +104,15 @@ class AgentConfiguration(BaseModel, Configuration):
             return default
 
         try:
+            if config_type is timedelta:
+                return parse_duration(value)
+            if issubclass(config_type, Enum) and isinstance(value, str):
+                for member in config_type:
+                    if value.casefold() in {
+                        member.name.casefold(),
+                        str(member.value).casefold(),
+                    }:
+                        return member
             return config_type(value)
         except (ValueError, TypeError) as e:
             msg = f"Invalid value for {key}: {value}"
@@ -150,6 +162,13 @@ class AgentConfiguration(BaseModel, Configuration):
 
     @override
     def set(self, option: ConfigOption, value: Any) -> None:
+        if isinstance(value, timedelta):
+            self.conf_data[option.get_key()] = (
+                f"{value // timedelta(microseconds=1)} micros"
+            )
+            return
+        if isinstance(value, Enum):
+            value = value.value
         self.conf_data[option.get_key()] = (
             _serialize_targets(value)
             if option.get_key() == _TRACE_LOG_TARGETS_KEY

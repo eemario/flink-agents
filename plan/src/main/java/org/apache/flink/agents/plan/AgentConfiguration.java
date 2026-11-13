@@ -22,7 +22,9 @@ import org.apache.flink.agents.api.configuration.ConfigOption;
 import org.apache.flink.agents.api.configuration.Configuration;
 import org.apache.flink.agents.api.logger.TraceLogTarget;
 import org.apache.flink.configuration.ConfigurationUtils;
+import org.apache.flink.util.TimeUtils;
 
+import java.time.Duration;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -88,7 +90,11 @@ public class AgentConfiguration implements Configuration {
         if (value == null && option.getDefaultValue() != null) {
             return;
         }
-        confData.put(option.getKey(), value);
+        if (value instanceof Duration) {
+            confData.put(option.getKey(), TimeUtils.formatWithHighestUnit((Duration) value));
+        } else if (value instanceof Enum<?>) {
+            confData.put(option.getKey(), ((Enum<?>) value).name());
+        } else confData.put(option.getKey(), value);
     }
 
     @Override
@@ -165,6 +171,12 @@ public class AgentConfiguration implements Configuration {
             return targetType.cast(Double.parseDouble(rawValue.toString()));
         } else if (Boolean.class.equals(targetType)) {
             return targetType.cast(Boolean.parseBoolean(rawValue.toString()));
+        } else if (Duration.class.equals(targetType)) {
+            String text = rawValue.toString().trim();
+            return targetType.cast(
+                    text.startsWith("-")
+                            ? TimeUtils.parseDuration(text.substring(1)).negated()
+                            : TimeUtils.parseDuration(text));
         } else if (targetType.isEnum()) {
             return ConfigurationUtils.convertValue(rawValue, targetType);
         } else {

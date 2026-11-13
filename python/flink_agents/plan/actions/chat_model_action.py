@@ -21,6 +21,7 @@ import re
 import time
 from concurrent.futures import CancelledError
 from dataclasses import dataclass
+from datetime import timedelta
 from functools import wraps
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Sequence, cast
 from uuid import UUID
@@ -40,6 +41,7 @@ from flink_agents.api.events.chat_event import ChatRequestEvent, ChatResponseEve
 from flink_agents.api.events.event import Event
 from flink_agents.api.events.tool_event import ToolRequestEvent, ToolResponseEvent
 from flink_agents.api.memory_object import MemoryObject
+from flink_agents.api.react_loop_budget import BudgetMode, ReActLoopBudget
 from flink_agents.api.resource import ResourceType
 from flink_agents.api.runner_context import RunnerContext
 from flink_agents.api.trace import (
@@ -57,6 +59,8 @@ if TYPE_CHECKING:
     from flink_agents.api.chat_models.chat_model import BaseChatModelSetup
     from flink_agents.api.metric_group import MetricGroup
 
+_BUDGET_FINALIZATION_SUFFIX = ":budget-final"
+_LOOP_BUDGET_CONTEXT = "_LOOP_BUDGET_CONTEXT"
 _TOOL_CALL_CONTEXT = "_TOOL_CALL_CONTEXT"
 _TOOL_REQUEST_EVENT_CONTEXT = "_TOOL_REQUEST_EVENT_CONTEXT"
 _RETRY_STATS_CONTEXT = "_RETRY_STATS_CONTEXT"
@@ -213,8 +217,92 @@ def _send_failure(
     )
 
 
+def _get_budget_contexts(memory: MemoryObject) -> dict:
+    return memory.get(_LOOP_BUDGET_CONTEXT) or {}
+
+
+def _get_budget_state(memory: MemoryObject, request_id: UUID) -> dict | None:
+    return _get_budget_contexts(memory).get(str(request_id))
+
+
+def _save_budget_state(
+    memory: MemoryObject, request_id: UUID, budget_state: dict | None
+) -> None:
+    contexts = dict(_get_budget_contexts(memory))
+    if budget_state is None:
+        if contexts.pop(str(request_id), None) is None:
+            return
+    else:
+        contexts[str(request_id)] = dict(budget_state)
+    memory.set(_LOOP_BUDGET_CONTEXT, contexts)
+
+
+def _is_soft_limit(memory: MemoryObject, request_id: UUID) -> bool:
+    budget_state = _get_budget_state(memory, request_id)
+    return budget_state is not None and budget_state["mode"] == BudgetMode.SOFT.value
+
+
+def _try_start_turn(
+    memory: MemoryObject,
+    request_id: UUID,
+    now_millis: int | None = None,
+) -> str | None:
+    """Check all limits and consume one turn when ordinary inference may start."""
+    budget_state = _get_budget_state(memory, request_id)
+    if budget_state is None:
+        return None
+    if "max_time_ms" in budget_state:
+        if now_millis is None:
+            now_millis = time.time_ns() // 1_000_000
+        elapsed = max(0, now_millis - budget_state["started_at_ms"])
+        if elapsed >= budget_state["max_time_ms"]:
+            return "TIME_BUDGET_EXCEEDED"
+    if budget_state.get("tokens_left") == 0:
+        return "TOKEN_BUDGET_EXCEEDED"
+    if "turns_left" in budget_state:
+        if budget_state["turns_left"] == 0:
+            return "TURN_BUDGET_EXCEEDED"
+        budget_state = dict(budget_state)
+        budget_state["turns_left"] -= 1
+        _save_budget_state(memory, request_id, budget_state)
+    return None
+
+
+def _update_token_budget_state(
+    memory: MemoryObject,
+    request_id: UUID,
+    response: ChatResult | None,
+) -> None:
+    budget_state = _get_budget_state(memory, request_id)
+    if (
+        not budget_state
+        or "tokens_left" not in budget_state
+        or not isinstance(response, ChatResult)
+    ):
+        return
+    usage = response.usage
+    if usage is None or (
+        usage.prompt_tokens is None and usage.completion_tokens is None
+    ):
+        _logger.warning("Missing token usage for chat request %s", request_id)
+        return
+    budget_state = dict(budget_state)
+    budget_state["tokens_left"] = max(
+        0,
+        budget_state["tokens_left"]
+        - (usage.prompt_tokens or 0)
+        - (usage.completion_tokens or 0),
+    )
+    _save_budget_state(memory, request_id, budget_state)
+
+
+def _closing_messages(messages: List[ChatMessage]) -> List[ChatMessage]:
+    instruction = "Give your final answer now using the information already available. Do not call tools."
+    return [*messages, ChatMessage.user(instruction)]
+
+
 def _clear_request_context(memory: MemoryObject, request_id: UUID) -> None:
-    for key in (_TOOL_CALL_CONTEXT, _RETRY_STATS_CONTEXT):
+    for key in (_TOOL_CALL_CONTEXT, _RETRY_STATS_CONTEXT, _LOOP_BUDGET_CONTEXT):
         context = dict(memory.get(key) or {})
         if context.pop(str(request_id), None) is not None:
             memory.set(key, context)
@@ -619,6 +707,7 @@ class _ChatAttemptResult:
     response: ChatResult
     chat_model: "BaseChatModelSetup"
     structured_output: Any
+    budget_reason: str | None = None
 
 
 class _ChatAttemptFailed(Exception):
@@ -643,6 +732,10 @@ async def _chat_with_retries(
     Provider and preparation failures raise ``_ChatAttemptFailed``. Cancellation
     and durable storage failures propagate unchanged to the runtime.
     """
+    reason = _try_start_turn(ctx.sensory_memory, initial_request_id)
+    closing = reason is not None
+    if closing and not _is_soft_limit(ctx.sensory_memory, initial_request_id):
+        raise _ChatAttemptFailed(RuntimeError(reason))
     try:
         chat_model = cast(
             "BaseChatModelSetup", ctx.get_resource(model, ResourceType.CHAT_MODEL)
@@ -650,6 +743,10 @@ async def _chat_with_retries(
     except (CancelledError, InterruptedError):
         raise
     except Exception as error:
+        if closing:
+            error = RuntimeError(
+                f"Soft finalization failed: {error} (budget reason: {reason})"
+            )
         raise _ChatAttemptFailed(error) from error
 
     # Evaluated once: the answer depends only on the chat model and the schema, and
@@ -665,6 +762,10 @@ async def _chat_with_retries(
         except (CancelledError, InterruptedError):
             raise
         except Exception as error:
+            if closing:
+                error = RuntimeError(
+                    f"Soft finalization failed: {error} (budget reason: {reason})"
+                )
             raise _ChatAttemptFailed(error) from error
 
     request_metric_group = ctx.action_metric_group
@@ -692,13 +793,26 @@ async def _chat_with_retries(
     ) -> tuple[ChatResult | None, str | None]:
         return _invoke_chat(chat_model, messages, prompt_args)
 
+    def close(
+        messages: List[ChatMessage], prompt_args: Dict
+    ) -> tuple[ChatResult | None, str | None]:
+        try:
+            return chat_model._chat_without_tools(
+                _closing_messages(messages),
+                prompt_args,
+            ), None
+        except (CancelledError, InterruptedError):
+            raise
+        except Exception as error:
+            return None, _error_text(error)
+
     def invoke_structured(
         answer_text: str, output_schema: OutputSchema
     ) -> tuple[ChatResult | None, str | None]:
         return _invoke_finalization(chat_model, answer_text, output_schema)
 
     def retry_after(attempt: int, error: Exception) -> bool:
-        """Account for a failed attempt; False once the budget is spent."""
+        """Account for a failed attempt; False once the retry budget is spent."""
         nonlocal actual_retry_count, total_wait_time_sec, final_error
         if attempt == num_retries:
             _logger.debug(
@@ -718,6 +832,9 @@ async def _chat_with_retries(
         if current_wait_sec > 0:
             time.sleep(current_wait_sec)
             total_wait_time_sec += current_wait_sec
+        _accumulate_retry_stats(
+            ctx.sensory_memory, initial_request_id, 1, current_wait_sec
+        )
         return True
 
     try:
@@ -729,12 +846,15 @@ async def _chat_with_retries(
             # so durable calls stay outside the try blocks below.
             response, failure = await _durable_invoke(
                 ctx,
-                invoke,
+                close if closing else invoke,
                 messages,
                 chat_async=chat_async,
                 prompt_args=prompt_args,
-                durable_id=durable_id,
+                durable_id=durable_id + _BUDGET_FINALIZATION_SUFFIX
+                if closing
+                else durable_id,
             )
+            _update_token_budget_state(ctx.sensory_memory, initial_request_id, response)
             try:
                 response = _accept_model_response(
                     ctx,
@@ -771,6 +891,9 @@ async def _chat_with_retries(
                     chat_async=chat_async,
                     durable_id=f"{durable_id}:final",
                 )
+                _update_token_budget_state(
+                    ctx.sensory_memory, initial_request_id, structured
+                )
                 try:
                     structured = _accept_model_response(
                         ctx,
@@ -796,18 +919,14 @@ async def _chat_with_retries(
     finally:
         _record_retry_metrics(ctx, model, actual_retry_count, total_wait_time_sec)
 
-    if actual_retry_count > 0:
-        _accumulate_retry_stats(
-            ctx.sensory_memory,
-            initial_request_id,
-            actual_retry_count,
-            total_wait_time_sec,
-        )
-
     if final_error is not None:
+        if closing:
+            final_error = RuntimeError(
+                f"Soft finalization failed: {final_error} (budget reason: {reason})"
+            )
         raise _ChatAttemptFailed(final_error) from final_error
 
-    return _ChatAttemptResult(response, chat_model, structured_output)
+    return _ChatAttemptResult(response, chat_model, structured_output, reason)
 
 
 async def chat(
@@ -842,6 +961,17 @@ async def chat(
     response = attempt.response
     chat_model = attempt.chat_model
     structured_output = attempt.structured_output
+    if attempt.budget_reason is not None and response.tool_calls:
+        _send_failure(
+            initial_request_id,
+            RuntimeError(
+                "Soft finalization returned tool calls "
+                f"(budget reason: {attempt.budget_reason})"
+            ),
+            ctx,
+            user_context,
+        )
+        return
 
     if (
         len(response.tool_calls) > 0
@@ -873,8 +1003,38 @@ async def chat(
         ctx.send_event(completed)
 
 
+def _budget_start_time_ms() -> int:
+    """Return a replayable loop start time before the first model call."""
+    return time.time_ns() // 1_000_000
+
+
 async def _process_chat_request(event: ChatRequestEvent, ctx: RunnerContext) -> None:
     """Process chat request event."""
+    limits = event.budget
+    if limits is None:
+        config = ctx.config
+        limits = ReActLoopBudget(
+            max_turns=config.get(AgentExecutionOptions.LOOP_MAX_TURNS),
+            max_tokens=config.get(AgentExecutionOptions.LOOP_MAX_TOKENS),
+            max_time=config.get(AgentExecutionOptions.LOOP_MAX_TIME),
+            mode=config.get(AgentExecutionOptions.LOOP_BUDGET_MODE),
+        )
+    budget_state = {}
+    if limits.max_turns is not None:
+        budget_state["turns_left"] = limits.max_turns
+    if limits.max_tokens is not None:
+        budget_state["tokens_left"] = limits.max_tokens
+    if (
+        limits.max_time is not None
+        and _get_budget_state(ctx.sensory_memory, event.id) is None
+    ):
+        budget_state["max_time_ms"] = limits.max_time // timedelta(milliseconds=1)
+        budget_state["started_at_ms"] = ctx.durable_execute(
+            _budget_start_time_ms, durable_id="react-loop:budget-start"
+        )
+    if budget_state and _get_budget_state(ctx.sensory_memory, event.id) is None:
+        budget_state["mode"] = limits.mode.value
+        _save_budget_state(ctx.sensory_memory, event.id, budget_state)
     await chat(
         initial_request_id=event.id,
         model=event.model,

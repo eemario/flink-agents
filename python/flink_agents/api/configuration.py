@@ -15,8 +15,10 @@
 #  See the License for the specific language governing permissions and
 # limitations under the License.
 #################################################################################
+import re
 from abc import ABC, abstractmethod
 from copy import deepcopy
+from datetime import timedelta
 from typing import Any, Type
 
 
@@ -174,3 +176,49 @@ class Configuration(WritableConfiguration, ReadableConfiguration, ABC):
     """A configuration object that provides both read and write access to a
     configuration object.
     """
+
+
+def parse_duration(value: object) -> timedelta:
+    """Parse a duration without imposing a configuration-specific limit.
+
+    Unitless strings use milliseconds. Sub-microsecond values are rejected
+    because timedelta cannot represent them without losing precision.
+    """
+    if not isinstance(value, str | timedelta):
+        msg = f"Expected a timedelta or duration string, got {type(value).__name__}"
+        raise TypeError(msg)
+    if isinstance(value, str):
+        match = re.fullmatch(r"\s*([+-]?\d+)\s*([a-zA-Zµ]*)\s*", value)
+        units = {
+            "": 1000,
+            "micro": 1,
+            "µs": 1,
+            "microsecond": 1,
+            "ms": 1000,
+            "millisecond": 1000,
+            "milli": 1000,
+            "s": 10**6,
+            "sec": 10**6,
+            "second": 10**6,
+            "m": 60 * 10**6,
+            "min": 60 * 10**6,
+            "minute": 60 * 10**6,
+            "h": 3600 * 10**6,
+            "hour": 3600 * 10**6,
+            "d": 86400 * 10**6,
+            "day": 86400 * 10**6,
+        }
+        if match:
+            name = match[2].lower()
+            unit = units.get(name, units.get(name.removesuffix("s")))
+            if (
+                name in {"ns", "nano", "nanos", "nanosecond", "nanoseconds"}
+                and int(match[1]) % 1000 == 0
+            ):
+                value = timedelta(microseconds=int(match[1]) // 1000)
+            elif unit:
+                value = timedelta(microseconds=int(match[1]) * unit)
+    if isinstance(value, timedelta):
+        return value
+    msg = f"Invalid duration: {value!r}; expected a timedelta or duration string"
+    raise ValueError(msg)
