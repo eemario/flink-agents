@@ -202,6 +202,10 @@ for retry metrics.
 | Key | Default | Type | Description |
 | --- | --- | --- | --- |
 | `chat.async` | true | boolean | Enable durable async execution for built-in Chat model calls, including routing judge calls. `false` selects synchronous execution. |
+| `react-loop.budget.max-turns` | unlimited | int | Maximum ordinary inference rounds per chat request. |
+| `react-loop.budget.max-time` | unlimited | duration | Elapsed time since loop start, including recovery downtime (e.g. `60 s`); must be a positive whole number of milliseconds. |
+| `react-loop.budget.max-tokens` | unlimited | long | Cumulative reported input and output tokens of the loop. |
+| `react-loop.budget.mode` | `soft` | enum | `soft` allows one tool-free final inference round; `hard` returns a failed chat response. See [Loop budgets]({{< ref "docs/development/react_agent#limit-a-react-loop" >}}). |
 | `decision.async` | true | boolean | Enable durable async execution for built-in Decision Model calls. `false` selects synchronous execution. |
 | `max-retries` | 0 | int | Maximum retries after the initial attempt of a built-in Chat or Decision Model call, including routing judge calls. Non-positive values disable retries. |
 | `rag.async` | true | boolean | Enable durable async execution for vector-store queries made by the built-in context retrieval Action. `false` selects synchronous execution. |

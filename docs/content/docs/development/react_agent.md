@@ -403,6 +403,76 @@ Every skill found in the sources becomes available, and the resolved names are a
 
 **Which declaration wins.** Sources reach the agent from three levels. `@Skills`/`@skills` methods are merged first, then the execution environment's `SKILLS` resources, then the agent's own. A declaration from a later level wins when two of them resolve to the same skill name.
 
+## Limit a ReAct loop
+
+A budget applies separately to each chat request. Use `ReActAgent(..., budget=...)`
+in Python, or pass the budget after the skills argument in the Java constructor.
+You can also pass a budget directly to Python `ctx.chat` or to a
+`ChatRequestEvent` in either language.
+
+```python
+from datetime import timedelta
+from flink_agents.api.react_loop_budget import ReActLoopBudget
+
+agent = ReActAgent(chat_model=chat_model_descriptor, budget=ReActLoopBudget(
+    max_turns=4, max_time=timedelta(seconds=60), max_tokens=8000,
+))
+```
+
+In Java, construct the budget with a builder:
+
+```java
+ReActLoopBudget budget = ReActLoopBudget.builder()
+        .maxTurns(2)
+        .maxTime(Duration.ofSeconds(60))
+        .build();
+```
+
+An omitted or explicitly null mode uses `SOFT` in both Java and Python.
+
+For job-wide defaults, set the following entries in the agent configuration file.
+A request budget **replaces** these defaults as a whole. An explicit empty
+budget removes all limits for that request. Omitted limits are unlimited.
+Time limits must be positive whole milliseconds; finer values are rejected.
+
+```yaml
+agent:
+  react-loop:
+    budget:
+      max-turns: 4
+      max-time: 60 s
+      max-tokens: 8000
+      mode: soft
+```
+
+| Limit | What counts |
+| --- | --- |
+| Turns | One ordinary inference plus the tools it requests. The last allowed turn may run its tools; the limit stops the next turn. Provider retries and structured-output conversion do not start new turns. |
+| Tokens | This loop's reported input and output tokens, including LLM routing, retries and structured-output conversion. Missing usage is not estimated. A single call can cross the threshold; a valid final answer is accepted without another call. |
+| Time | Elapsed time including waits for models, tools and subagents. The runtime checks before each inference round; it does not cancel an in-flight operation when time runs out. |
+
+When a limit prevents further inference, `soft` (default) gives the model one
+extra tool-free inference round to answer from the available context, including
+configured retries and structured-output conversion. Budgets are checked only
+at round entry, not during retries or conversion. Token usage is recorded for
+every returned response. An admitted round may complete its inference and tools
+even after a threshold is reached; limits are checked if another round is needed.
+Framework-managed LLM routing belongs to the initial round and shares its token
+budget; it does not consume an additional turn. Admission is checked before
+routing. A soft closing round may still route to select the answering model.
+The closing round cannot start tools or another round.
+`hard` fails the request without this extra round. Neither mode interrupts
+in-flight work or rejects a completed final answer merely because time expired. Failures use the
+existing failed chat response: a caller can catch it when awaiting the chat;
+an unhandled root failure follows the job's failure policy.
+
+Subagents start independent loops. The parent includes time spent waiting for
+them, but does not add their turns or tokens. The loop start time and budget usage are stored in sensory memory and
+checkpointed. Recovery retains the start time, so downtime counts toward the
+time budget. A durable ActionStateStore can replay completed action updates
+and results. Calls whose results were not persisted may execute again and
+incur additional charges not covered by the recovered usage.
+
 ## As a Sub-Agent
 
 A ReActAgent can run as a sub-agent of another agent, delegated to by the parent's chat model or called from the parent's actions. See [A ReActAgent as the child]({{< ref "docs/development/multi-agent/subagents#a-reactagent-as-the-child" >}}).
